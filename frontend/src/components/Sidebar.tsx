@@ -32,7 +32,7 @@ const NAV_ITEMS: NavItem[] = [
   { label: 'My Sessions', path: '/sessions', icon: MonitorPlay },
   { label: 'Assets', path: '/assets', icon: Server },
   { label: 'Applications', path: '/applications', icon: Globe },
-  { label: 'Approvals', path: '/approvals', icon: CheckSquare, roles: ['ADMIN', 'APPROVER'] },
+  { label: 'Approvals', path: '/approvals', icon: CheckSquare, roles: ['ADMIN', 'APPROVER', 'AUDITOR'] },
   { label: 'Recordings', path: '/recordings', icon: Video, roles: ['ADMIN', 'AUDITOR'] },
   { label: 'Audit Logs', path: '/audit', icon: ScrollText, roles: ['ADMIN', 'AUDITOR'] },
   { label: 'Risk Center', path: '/risk', icon: Gauge, roles: ['ADMIN', 'APPROVER', 'AUDITOR'] },

@@ -338,6 +338,7 @@ async def _seed_default_data():
             permissions["assets:read"],
             permissions["applications:read"],
             permissions["policies:read"],
+            permissions["approvals:read"],
         ]
 
         db.add_all([admin_role, operator_role, approver_role, auditor_role])

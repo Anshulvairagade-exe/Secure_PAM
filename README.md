@@ -6,11 +6,12 @@ through: authenticate → authorize → evaluate risk → approve if required �
 grant JIT access → retrieve credentials → establish a monitored/recorded
 session → revoke on expiry → audit everything.
 
-**Current phase: 3 (Assets, Applications, Policies & real RBAC).** Login,
-RBAC, the dashboard, health checks, the full data model, and now Asset/
-Application/Policy management (CRUD + enforcement + audit logging) exist
-and are tested end-to-end. The risk/approval/JIT engines and the
-RDP/SSH/web gateways are not built yet — see [Status](#status).
+**Current phase: 4 (the core PAM decision engine).** Login, RBAC, Assets/
+Applications/Policies CRUD, and now the full Access Request → Policy
+Evaluation → Explainable Risk → Approval → JIT workflow exist and are
+tested end-to-end against real PostgreSQL. OpenBao/Vault, Keycloak,
+Guacamole/SSH/web gateways, and the Risk/Policy engines' own UI (beyond
+what the request detail page shows) are not built yet — see [Status](#status).
 
 ## Architecture
 
@@ -135,6 +136,210 @@ curl -X POST http://localhost:8000/api/v1/assets \
 - **Never trust the frontend** for role, user ID, permissions, target
   URL, or policy decisions — every one of those is re-derived or
   re-checked server-side on every request.
+
+## Access Requests, Policy Evaluation, Risk, Approval & JIT
+
+This is the core PAM decision engine. One service — `AccessDecisionService`
+(`app/services/access_decision.py`) — owns the entire pipeline; nothing
+here is duplicated across API routes.
+
+```
+POST /access-requests
+        │
+        ▼
+  load + validate target ──── not found / disabled / protocol
+        │                     mismatch / both-or-neither target  ──▶ 422
+        ▼
+  load target's Policy (or: none assigned → fail-safe default)
+        │
+        ▼
+  PolicyEvaluator.evaluate_access()  ──────────┐
+   (app/policies/evaluator.py)                 │  kept deliberately
+        │                                      │  separate — see
+  evaluate_risk()  ────────────────────────────┘  "Risk vs. Policy" below
+   (app/risk/engine.py)
+        │
+        ▼
+  decision matrix (AccessDecisionService._decide) ─▶ DENIED | APPROVAL_REQUIRED | APPROVED
+        │                                                  │              │
+        │                                           Approval row    JITGrant created
+        │                                           created          immediately
+        ▼                                                  │              │
+  AccessRequest persisted,                                 ▼              ▼
+  RiskEvent persisted,                          POST /approvals/{id}/approve|reject
+  audit events written                                     │
+                                                    approve ─▶ JITGrant created
+```
+
+### Access Request lifecycle
+
+```
+PENDING ──────────┬─→ APPROVAL_REQUIRED ─┬─→ APPROVED ─┬─→ ACTIVE ─→ EXPIRED
+ (transient —      │                      ├─→ REJECTED │
+  see below)       ├─→ APPROVED ──────────┘             └─→ EXPIRED
+                   ├─→ DENIED
+                   ├─→ CANCELLED
+                   └─→ EXPIRED
+```
+
+`PENDING` is the formal starting state but is never actually persisted at
+rest: `AccessDecisionService.create_request()` runs policy + risk
+evaluation synchronously inside the same request, so by the time
+`POST /access-requests` returns, the row already reads `APPROVAL_REQUIRED`,
+`APPROVED` (immediately followed by `ACTIVE` once the JIT grant is
+created), or `DENIED`. The state exists for a future async/queued
+evaluation model and because `ALLOWED_TRANSITIONS` needs a defined
+starting point. Every transition is checked against that explicit map —
+`check_transition()` raises (mapped to `409`) on anything not listed,
+closing off state-transition bypass (approving an already-rejected
+request, cancelling an active one, etc).
+
+### Policy Evaluation vs. Risk Evaluation — kept separate on purpose
+
+`PolicyEvaluator` (`app/policies/evaluator.py`) answers *"does the rules-
+based policy for this target permit this request, and what controls does
+it demand?"* `evaluate_risk()` (`app/risk/engine.py`) answers *"how
+risky does this specific request look?"* Neither function calls the
+other. `AccessDecisionService` is the only place they're combined — this
+means either can be tuned, re-weighted, or unit-tested in total isolation
+without touching the other, and the frontend's "Policy Decision" and
+"Risk Evaluation" panels on the request detail page are genuinely
+independent explanations, not one narrative split across two boxes.
+
+**No policy assigned, or the assigned policy is disabled:** fail-safe
+default — `allowed=True` (the request can still proceed to the approval
+queue) but `approval_required=True`, `mfa_required=True`,
+`max_duration=30`. More scrutiny when nothing explicit governs a target,
+never less — and necessary in practice, since most registered Assets/
+Applications won't have a Policy assigned.
+
+**Policy evaluation checks, in order:** `deny_access` (explicit, always
+wins) → `allowed_roles` → `allowed_asset_types` → `allowed_environments`
+→ `allowed_protocols` → `business_hours_only` → `allowed_days`. An
+over-long `requested_duration` is **clamped** to `max_session_duration`,
+never rejected — the spec's own example: requested 120 minutes, policy
+maximum 30 minutes → the grant is 30 minutes, not an error.
+
+### Risk scoring
+
+`app/risk/engine.py` — deterministic, explainable, **not** machine
+learning, **not** an external model. Same inputs always produce the same
+score. Every factor carries a `code`, `points`, and a human-readable
+`reason`; `score == sum(points)`.
+
+| Factor | Points | Fires when |
+|---|---|---|
+| `PRODUCTION_ASSET` | +30 | Target's `environment == PRODUCTION` |
+| `CRITICAL_ASSET` | +25 | Asset target, `criticality == CRITICAL` |
+| `HIGH_CRITICALITY` | +15 | Asset target, `criticality == HIGH` (mutually exclusive with CRITICAL_ASSET) |
+| `SENSITIVE_APPLICATION` | +20 | Application target, `criticality` HIGH or CRITICAL |
+| `HIGH_PRIVILEGE_ROLE` | +20 | Requester holds an ADMIN role |
+| `OUTSIDE_BUSINESS_HOURS` | +20 | Outside 09:00–17:00 UTC, Mon–Fri |
+| `UNKNOWN_CONTEXT` | +20 | Request's source IP couldn't be determined |
+| `REPEATED_AUTH_FAILURE` | +20 | `User.failed_login_count > 0` |
+| `UNUSUAL_ACCESS_PATTERN` | +20 | Requester's first-ever access request (no prior request history) |
+| `LONG_DURATION` | +10 | `requested_duration > 60` minutes |
+
+**Levels:** 0–29 `LOW` · 30–59 `MEDIUM` · 60–79 `HIGH` · 80+ `CRITICAL`.
+
+> **These weights are this project's own choices for Phase 4's
+> demonstrable, explainable engine** — not an industry standard, not
+> derived from any external framework or real incident data, and not
+> validated against anything beyond "does the resulting score make
+> intuitive sense for the scenario." Tune `RISK_WEIGHTS` in
+> `app/risk/engine.py` for a real deployment; the constant names are
+> written to be found and argued with, not buried in conditionals.
+
+### Decision matrix — risk can escalate scrutiny, never grant what policy didn't
+
+```
+policy.allowed == False        → DENIED                         (always — policy is authoritative)
+risk == CRITICAL, no policy    → DENIED                         (fail-safe: nothing vouches for this target)
+risk == CRITICAL, has policy   → APPROVAL_REQUIRED               (elevated/human approval)
+risk == HIGH                   → APPROVAL_REQUIRED               (always, regardless of policy.auto_approve)
+risk == MEDIUM / LOW           → policy-dependent:
+                                    policy.require_approval OR NOT policy.auto_approve → APPROVAL_REQUIRED
+                                    otherwise                                          → APPROVED
+```
+
+There is deliberately no path that reads "high risk = automatically
+allowed" — see `test_access_requests.py::test_high_risk_forces_approval_even_with_auto_approve_policy`.
+
+### Approval workflow
+
+A pending `Approval` row (`status=PENDING`) is created the moment a
+request needs human review — not retroactively once decided — so it
+shows up in `GET /approvals` immediately. `POST /approvals/{id}/approve`
+or `/reject`:
+
+- **Self-approval is blocked** (`403`) — `approver.id == access_request.user_id` is checked before anything else state-related.
+- **Double-decision is blocked** (`409`) — an approval already `APPROVED`/`REJECTED` can't be redecided.
+- **Rejection requires a comment** (`422` without one); approval's comment is optional.
+- Approving transitions the request `APPROVAL_REQUIRED → APPROVED → ACTIVE` and creates the JIT grant in the same call — see `AccessDecisionService.approve()`.
+
+### JIT lifecycle
+
+`JITService` (`app/services/jit_service.py`) is the **single authoritative
+source of truth** for "is this grant currently valid?" — not a UI
+countdown, not a client-side timer. `grant()` is the only place an
+expiry is ever computed, and it always clamps to the policy/decision
+maximum (`min(requested, policy.max_session_duration)`) — a caller
+cannot hand it an arbitrary duration and have it honored past that
+ceiling. `validate(user_id, target_id, protocol)` is the exact interface
+future gateway integrations (Guacamole/RDP, SSH, Web) must call before
+establishing a session; it also lazily flips a found-but-lapsed `ACTIVE`
+grant to `EXPIRED` so stale rows don't linger just because nothing
+checked them. `revoke()` is immediate and explicit (an admin pulling
+access mid-session); `expire()` is for a future background sweep.
+
+**No JIT REST endpoint exists in Phase 4** — this is deliberately a
+Python-level service for the control plane and future gateway code, not
+an HTTP surface the spec asked for. It's exercised directly in
+`tests/test_jit_service.py` and in the Phase 4 verification workflow
+below via a short script, the same way Phase 2 exercised
+`PermissionChecker` directly before any endpoint used it.
+
+### API endpoints
+
+```
+POST   /api/v1/access-requests              -> runs the full decision pipeline synchronously
+GET    /api/v1/access-requests               ?page,page_size,sort_by,sort_order,status
+GET    /api/v1/access-requests/{id}
+POST   /api/v1/access-requests/{id}/cancel
+
+GET    /api/v1/approvals                     ?page,page_size,sort_by,sort_order,status
+GET    /api/v1/approvals/{id}
+POST   /api/v1/approvals/{id}/approve        {comment?: string}
+POST   /api/v1/approvals/{id}/reject         {comment: string}   # mandatory
+```
+
+No separate `/access-requests/{id}/approve|reject` — the spec explicitly
+warned against duplicating state-changing logic across endpoints, so the
+Approval resource above is the one canonical path; `/access-requests`
+only exposes create/read/cancel.
+
+### Security assumptions
+
+- **Business hours are fixed** at 09:00–17:00 UTC, Monday–Friday
+  (`app/core/business_hours.py`) — a real deployment needs this
+  per-organization (timezone, holidays, shifts). Explicitly out of scope
+  for a deterministic Phase 4 engine.
+- **`UNKNOWN_CONTEXT`** only fires when the source IP is literally
+  unavailable — it is not a substitute for real device/location
+  fingerprinting (no such signal exists yet in this codebase).
+- **`UNUSUAL_ACCESS_PATTERN`** is a simple, explainable rule (first-ever
+  request), not a learned behavioral baseline — by design, since the
+  risk engine must stay deterministic and non-ML.
+- **The approval queue expiry** (`APPROVAL_EXPIRY_HOURS = 24` in
+  `access_decision.py`) is a project-specific constant, not enforced by
+  a background sweep yet — a request past its `expires_at` while still
+  `APPROVAL_REQUIRED` is not automatically flipped to `EXPIRED` today;
+  that's future work alongside JIT's own `expire()` sweep.
+- Every field a client might want to forge — `requester_id`, `risk_score`,
+  `risk_level`, `policy_decision`, `approval_required`, `jit_required`,
+  `expires_at`, `status` — simply isn't a field on `AccessRequestCreate`
+  (see `app/schemas/access_requests.py`); there's no value to "ignore"
+  because there's no field to accept it into.
 
 ## Tech stack
 
@@ -316,20 +521,26 @@ reach the ORM constructor.
 
 Implemented and tested: project scaffolding, Docker Compose, all 17
 SQLAlchemy models with full FK referential integrity, Alembic migrations
-(verified from an empty DB), DevAuth login/`/me`, dashboard (real
-DB-backed counts only), structured logging + request IDs, consistent API
-error envelope, `/health`, `/health/live`, `/health/ready`,
-pagination/sorting utilities, React frontend shell (routing, auth
-context, protected routes, role-based nav) — and, as of Phase 3, full
-Asset/Application/Policy CRUD with real RBAC enforcement
-(`PermissionChecker` now actually gates every endpoint above, writing an
-audit event on both success and denial), SSRF-safe Application
-registration, and real Assets/Applications/Policies pages in the
-frontend (search, filter, sort, pagination, create/edit/delete — no
-fake data anywhere).
+(verified from an empty DB and from a populated one, both directions),
+DevAuth login/`/me`, dashboard (real DB-backed counts only), structured
+logging + request IDs, consistent API error envelope, `/health`,
+`/health/live`, `/health/ready`, pagination/sorting utilities, full
+Asset/Application/Policy CRUD with real RBAC enforcement and SSRF-safe
+Application registration — and, as of Phase 4, the complete core
+decision engine: Access Requests, the separated Policy/Risk evaluators,
+the decision matrix, the Approval workflow (self-approval and
+double-decision blocked, mandatory rejection reason), and `JITService`
+as the authoritative grant/validate/revoke/expire service for future
+gateways to call. React frontend: routing, auth context, protected
+routes, role-based nav, Assets/Applications/Policies pages, and now
+Access Requests (list/create/detail/cancel) and an Approvals queue —
+all real API data, no fake numbers anywhere.
 
 Not implemented: Keycloak/OIDC, Vault/OpenBao, Guacamole (RDP), SSH
-gateway, web reverse proxy, isolated browser, risk engine, approval
-workflow, JIT access, session recording, Wazuh/SIEM, Users/Roles CRUD
-(UI still shows an honest "planned for Phase N" placeholder for those
-and for Access Requests/Sessions/Recordings/Audit Logs/Risk Center/Vault).
+gateway, web reverse proxy, isolated browser, session recording,
+Wazuh/SIEM, Users/Roles CRUD, a JIT REST endpoint (deliberately — see
+the JIT lifecycle section above), and a background sweep for
+request-queue/JIT expiry (both are currently lazy — evaluated the next
+time something actually looks at the row, not on a timer). The UI still
+shows an honest "planned for Phase N" placeholder for Sessions/
+Recordings/Audit Logs/Risk Center/Vault/Users/Roles.

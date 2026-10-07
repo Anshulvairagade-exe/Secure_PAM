@@ -7,6 +7,10 @@ import Dashboard from '@/pages/Dashboard';
 import Assets from '@/pages/Assets';
 import Applications from '@/pages/Applications';
 import Policies from '@/pages/Policies';
+import AccessRequests from '@/pages/AccessRequests';
+import AccessRequestNew from '@/pages/AccessRequestNew';
+import AccessRequestDetail from '@/pages/AccessRequestDetail';
+import ApprovalsPage from '@/pages/Approvals';
 import ComingSoon from '@/pages/ComingSoon';
 import NotFound from '@/pages/NotFound';
 
@@ -23,15 +27,17 @@ export default function App() {
         }
       >
         <Route path="/" element={<Dashboard />} />
-        <Route path="/access-requests" element={<ComingSoon title="Access Requests" phase="Phase 5" />} />
+        <Route path="/access-requests" element={<AccessRequests />} />
+        <Route path="/access-requests/new" element={<AccessRequestNew />} />
+        <Route path="/access-requests/:id" element={<AccessRequestDetail />} />
         <Route path="/sessions" element={<ComingSoon title="My Sessions" phase="Phase 8" />} />
         <Route path="/assets" element={<Assets />} />
         <Route path="/applications" element={<Applications />} />
         <Route
           path="/approvals"
           element={
-            <ProtectedRoute requiredRoles={['ADMIN', 'APPROVER']}>
-              <ComingSoon title="Approvals" phase="Phase 5" />
+            <ProtectedRoute requiredRoles={['ADMIN', 'APPROVER', 'AUDITOR']}>
+              <ApprovalsPage />
             </ProtectedRoute>
           }
         />

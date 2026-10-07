@@ -100,7 +100,7 @@ class RiskEvent(Base, UUIDMixin):
     # Risk result
     risk_score: Mapped[int] = mapped_column(nullable=False)
     risk_level: Mapped[str] = mapped_column(String(10), nullable=False)
-    risk_factors: Mapped[dict] = mapped_column(JSON, nullable=False)
+    risk_factors: Mapped[list] = mapped_column(JSON, nullable=False)
 
     # Context
     evaluated_at: Mapped[datetime] = mapped_column(

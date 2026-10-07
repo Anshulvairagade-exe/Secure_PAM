@@ -26,10 +26,14 @@ import pytest_asyncio  # noqa: E402
 from httpx import ASGITransport, AsyncClient  # noqa: E402
 from sqlalchemy.ext.asyncio import AsyncSession  # noqa: E402
 
-from app.core.security import create_dev_access_token  # noqa: E402
+from sqlalchemy import select  # noqa: E402
+
+from app.core.security import create_dev_access_token, hash_password  # noqa: E402
 from app.database.base import Base  # noqa: E402
 from app.database.session import async_session_factory, engine  # noqa: E402
 from app.main import _seed_default_data, app  # noqa: E402
+from app.models.role import Role  # noqa: E402
+from app.models.user import User, UserRole  # noqa: E402
 
 
 @pytest_asyncio.fixture(autouse=True)
@@ -106,6 +110,34 @@ def approver_token() -> str:
 @pytest.fixture
 def auditor_token() -> str:
     return issue_token("auditor", ["AUDITOR"])
+
+
+@pytest_asyncio.fixture
+async def operator2_token() -> str:
+    """
+    A second OPERATOR account, for IDOR tests: the seeded `operator` and
+    `approver`/`auditor` fixtures aren't useful for "can peer user A see
+    user B's own-scoped resource" since approver/auditor hold view-all
+    permissions. Created directly in the DB (no Users CRUD API exists yet).
+    """
+    async with async_session_factory() as db:
+        result = await db.execute(select(Role).where(Role.name == "OPERATOR"))
+        operator_role = result.scalar_one()
+
+        user = User(
+            username="operator2",
+            email="operator2@securepam.local",
+            full_name="Second Operator",
+            hashed_password=hash_password("operator2pass"),
+            mfa_enabled=False,
+            is_active=True,
+        )
+        db.add(user)
+        await db.flush()
+        db.add(UserRole(user_id=user.id, role_id=operator_role.id))
+        await db.commit()
+
+    return issue_token("operator2", ["OPERATOR"])
 
 
 def auth_header(token: str) -> dict:

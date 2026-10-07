@@ -138,39 +138,64 @@ export interface AccessRequest {
   reason: string;
   requested_duration: number;
   status: RequestStatus;
+
   risk_score?: number;
   risk_level?: RiskLevel;
   risk_factors?: RiskFactor[];
-  source_ip?: string;
+
+  policy_decision?: PolicyDecision;
+  policy_id?: string;
+
+  approval_required: boolean;
+  jit_required: boolean;
+  mfa_required: boolean;
+  recording_required: boolean;
+
   created_at: string;
   updated_at: string;
-  // Joined fields
-  asset_name?: string;
-  application_name?: string;
-  user_name?: string;
+  expires_at?: string;
+  decided_at?: string;
+  decided_by?: string;
+}
+
+export interface AccessRequestInput {
+  asset_id?: string;
+  application_id?: string;
+  protocol: string;
+  reason: string;
+  requested_duration: number;
 }
 
 export interface RiskFactor {
-  factor: string;
-  score: number;
-  description?: string;
+  code: string;
+  points: number;
+  reason: string;
 }
 
-export interface RiskEvaluation {
-  risk_score: number;
-  risk_level: RiskLevel;
-  risk_factors: RiskFactor[];
+export interface PolicyDecision {
+  allowed: boolean;
+  policy_id: string | null;
+  policy_name: string | null;
+  approval_required: boolean;
+  mfa_required: boolean;
+  jit_required: boolean;
+  recording_required: boolean;
+  max_duration: number;
+  auto_approve: boolean;
+  reasons: string[];
 }
 
 // --- Approvals ---
+export type ApprovalStatus = 'PENDING' | 'APPROVED' | 'REJECTED';
+
 export interface Approval {
   id: string;
   request_id: string;
-  approver_id: string;
-  decision: 'APPROVED' | 'REJECTED';
+  approver_id?: string;
+  status: ApprovalStatus;
   comment?: string;
-  decided_at: string;
-  source_ip?: string;
+  decided_at?: string;
+  created_at: string;
 }
 
 // --- JIT Grants ---
@@ -309,7 +334,15 @@ export type RiskLevel = 'LOW' | 'MEDIUM' | 'HIGH' | 'CRITICAL';
 export type Criticality = 'LOW' | 'MEDIUM' | 'HIGH' | 'CRITICAL';
 export type Environment = 'PRODUCTION' | 'STAGING' | 'DEVELOPMENT' | 'TESTING';
 export type EntityStatus = 'ACTIVE' | 'INACTIVE' | 'MAINTENANCE';
-export type RequestStatus = 'PENDING' | 'APPROVED' | 'REJECTED' | 'EXPIRED' | 'CANCELLED' | 'ACTIVE' | 'COMPLETED';
+export type RequestStatus =
+  | 'PENDING'
+  | 'APPROVAL_REQUIRED'
+  | 'APPROVED'
+  | 'REJECTED'
+  | 'DENIED'
+  | 'EXPIRED'
+  | 'CANCELLED'
+  | 'ACTIVE';
 export type SessionStatus = 'CREATED' | 'STARTING' | 'ACTIVE' | 'TERMINATING' | 'COMPLETED' | 'FAILED' | 'EXPIRED';
 
 // --- Pagination ---

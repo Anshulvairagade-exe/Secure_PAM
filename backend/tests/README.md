@@ -47,6 +47,25 @@ tests rather than fought with.
 | `test_rbac.py` | `RoleChecker`/`PermissionChecker` exercised directly against real seeded users (bypassing HTTP) — see the **scope note** below |
 | `test_migrations.py` | A truly empty database built via `alembic upgrade head` only (not `create_all`), schema/model drift check (`alembic check`), and downgrade→upgrade reversibility — against its own disposable `securepam_migration_test` database |
 | `test_pagination.py` | `app/core/pagination.py` utilities directly (now also exercised indirectly through every list endpoint's own tests) |
+| `test_risk_engine.py` | Every risk factor individually, score/level boundaries (LOW/MEDIUM/HIGH/CRITICAL), explainability (`score == sum(points)`) — `now` always injected via `RiskContext`, never wall-clock |
+| `test_policy_engine.py` | Role/protocol/environment/asset-type restrictions, business-hours + allowed-days, duration clamping (not rejection), explicit `deny_access`, the no-policy/disabled-policy fail-safe default |
+| `test_access_requests.py` | XOR target validation, protocol-mismatch/disabled-target/excessive-duration 422s, privilege-escalation resistance, IDOR (404 not 403 for a peer's request), own-vs-view-all list scoping, cancel state machine, and the deterministic decision-matrix outcomes (see note below) |
+| `test_approvals.py` | Approve/reject, self-approval blocked (403), duplicate-decision blocked (409), mandatory rejection comment (422), RBAC on the approval queue, JIT duration clamped to the policy maximum on approval |
+| `test_jit_service.py` | `JITService` exercised directly (no REST endpoint exists for it — see its module docstring): grant/validate/revoke/expire, wrong-user/wrong-target/wrong-protocol denial, lazy-expiry |
+| `test_phase4_audit.py` | `ACCESS_REQUEST_CREATED`/`POLICY_EVALUATED`/`RISK_EVALUATED`/`APPROVAL_REQUESTED` or `ACCESS_ALLOWED`/`ACCESS_DENIED` on creation; `ACCESS_REQUEST_CANCELLED`; `APPROVAL_GRANTED`+`JIT_GRANTED`; `APPROVAL_REJECTED` |
+
+**Why some Phase 4 outcomes are tested via direct service calls, not
+HTTP:** `OUTSIDE_BUSINESS_HOURS` depends on real wall-clock time, which
+the HTTP route never lets a caller override (correctly — that's not a
+param a client should control). So `test_access_requests.py`'s
+decision-matrix tests (`test_policy_denial_yields_denied_status`,
+`test_critical_risk_with_no_policy_is_denied`, etc.) call
+`AccessDecisionService.create_request(..., now=<fixed datetime>)`
+directly — `now` is a test-only parameter, never passed by the API
+route — while everything RBAC/validation/IDOR-shaped goes through the
+real `client` fixture and tolerates the wobble by construction (e.g.
+using a policy with `require_approval=True` to force a deterministic
+outcome regardless of exactly how much risk accumulates).
 
 **Scope note on `test_rbac.py`:** written in Phase 2, before any endpoint
 used `RoleChecker`/`PermissionChecker`. Kept because testing the
@@ -65,6 +84,11 @@ directly here means passing both explicitly — see the top of the file.
   (e.g. `test_rbac.py`, `test_pagination.py`).
 - `admin_token` / `operator_token` / `approver_token` / `auditor_token` —
   dev JWTs for each seeded role.
+- `operator2_token` — a second OPERATOR account, created directly in the
+  DB (no Users CRUD API exists yet). Exists specifically for IDOR tests,
+  where the seeded `approver`/`auditor` accounts are useless (they hold
+  view-all permissions, so they're never the "peer who shouldn't see
+  this" side of an IDOR check).
 - `_prepared_database` (**function-scoped**, autouse) — builds the schema
   via `Base.metadata.create_all` and seeds it by calling the app's own
   `_seed_default_data()`, so every single test starts from exactly what a

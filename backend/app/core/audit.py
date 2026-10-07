@@ -9,6 +9,7 @@ row — see app/models/audit.py. NEVER pass secrets/passwords/tokens into
 
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
+from uuid import UUID
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -24,6 +25,7 @@ async def write_audit_log(
     action: str,
     target_type: Optional[str] = None,
     target_id: Optional[str] = None,
+    request_id: Optional[UUID] = None,
     source_ip: Optional[str] = None,
     result: str = "SUCCESS",
     severity: str = "INFO",
@@ -50,6 +52,7 @@ async def write_audit_log(
         action=action,
         target_type=target_type,
         target_id=target_id,
+        request_id=request_id,
         source_ip=source_ip,
         result=result,
         severity=severity,

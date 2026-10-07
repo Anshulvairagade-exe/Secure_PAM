@@ -16,6 +16,9 @@ import type {
   ApplicationInput,
   Policy,
   PolicyInput,
+  AccessRequest,
+  AccessRequestInput,
+  Approval,
   AuditLog,
   DetailedHealth,
   PaginatedResponse,
@@ -107,6 +110,38 @@ export const policiesApi = {
 
   delete: (id: string) =>
     apiClient.delete(`/policies/${id}`).then(r => r.data),
+};
+
+// --- Access Requests ---
+
+export const accessRequestsApi = {
+  list: (params?: ListParams) =>
+    apiClient.get<PaginatedResponse<AccessRequest>>('/access-requests', { params }).then(r => r.data),
+
+  get: (id: string) =>
+    apiClient.get<AccessRequest>(`/access-requests/${id}`).then(r => r.data),
+
+  create: (data: AccessRequestInput) =>
+    apiClient.post<AccessRequest>('/access-requests', data).then(r => r.data),
+
+  cancel: (id: string) =>
+    apiClient.post<AccessRequest>(`/access-requests/${id}/cancel`).then(r => r.data),
+};
+
+// --- Approvals ---
+
+export const approvalsApi = {
+  list: (params?: ListParams) =>
+    apiClient.get<PaginatedResponse<Approval>>('/approvals', { params }).then(r => r.data),
+
+  get: (id: string) =>
+    apiClient.get<Approval>(`/approvals/${id}`).then(r => r.data),
+
+  approve: (id: string, comment?: string) =>
+    apiClient.post<Approval>(`/approvals/${id}/approve`, { comment }).then(r => r.data),
+
+  reject: (id: string, comment: string) =>
+    apiClient.post<Approval>(`/approvals/${id}/reject`, { comment }).then(r => r.data),
 };
 
 // --- Audit ---
