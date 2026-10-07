@@ -1,0 +1,161 @@
+"""
+FastAPI dependencies — database sessions, auth, and service providers.
+"""
+
+from typing import AsyncGenerator, List, Optional
+
+from fastapi import Depends, HTTPException, Request, status
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.auth import InvalidTokenError, get_token_validator
+from app.database.session import async_session_factory
+from app.models.user import User, UserRole
+from app.models.role import Role
+
+
+# --- Database Dependency ---
+
+async def get_db() -> AsyncGenerator[AsyncSession, None]:
+    """Yield an async database session."""
+    async with async_session_factory() as session:
+        try:
+            yield session
+        except Exception:
+            await session.rollback()
+            raise
+
+
+# --- Auth Dependencies ---
+
+bearer_scheme = HTTPBearer(auto_error=False)
+
+
+async def get_current_user(
+    request: Request,
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(bearer_scheme),
+    db: AsyncSession = Depends(get_db),
+) -> User:
+    """
+    Extract and validate the current user from the request.
+
+    Identity (who is this?) is resolved by the configured TokenValidator
+    (DevAuth today, Keycloak/OIDC later — see app.auth). Authorization
+    (what can they do?) always comes from SecurePAM's own RBAC tables via
+    the local User row looked up below, never from the token itself.
+    """
+    if not credentials:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Authentication required",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    validator = get_token_validator()
+    try:
+        identity = validator.validate(credentials.credentials)
+    except InvalidTokenError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or expired token",
+        )
+    except NotImplementedError as e:
+        raise HTTPException(
+            status_code=status.HTTP_501_NOT_IMPLEMENTED,
+            detail=str(e),
+        )
+
+    # Resolve the token's identity to a local user. In DEV_MODE `subject` is
+    # the username; under OIDC it will be Keycloak's `sub`, matched against
+    # User.external_id instead — that lookup is added alongside OIDC support.
+    result = await db.execute(
+        select(User).where(
+            User.username == identity.subject,
+            User.is_active == True,
+            User.is_deleted == False,
+        )
+    )
+    user = result.scalar_one_or_none()
+
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="User not found or inactive",
+        )
+
+    return user
+
+
+def get_current_active_user(
+    current_user: User = Depends(get_current_user),
+) -> User:
+    """Ensure the current user is active."""
+    if not current_user.is_active:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="User account is disabled",
+        )
+    return current_user
+
+
+class RoleChecker:
+    """
+    Dependency that checks if the current user has the required role(s).
+    
+    Usage:
+        @router.get("/admin-only", dependencies=[Depends(RoleChecker(["ADMIN"]))])
+    """
+
+    def __init__(self, required_roles: List[str]):
+        self.required_roles = required_roles
+
+    async def __call__(
+        self,
+        current_user: User = Depends(get_current_active_user),
+    ) -> User:
+        user_roles = [ur.role.name for ur in current_user.roles if ur.role]
+        
+        if not any(role in user_roles for role in self.required_roles):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"Insufficient permissions. Required role: {', '.join(self.required_roles)}",
+            )
+        return current_user
+
+
+class PermissionChecker:
+    """
+    Dependency that checks if the current user has the required permission(s).
+    
+    Usage:
+        @router.post("/assets", dependencies=[Depends(PermissionChecker("assets", "create"))])
+    """
+
+    def __init__(self, resource: str, action: str):
+        self.resource = resource
+        self.action = action
+
+    async def __call__(
+        self,
+        current_user: User = Depends(get_current_active_user),
+    ) -> User:
+        user_permissions = set()
+        for ur in current_user.roles:
+            if ur.role:
+                for perm in ur.role.permissions:
+                    user_permissions.add(f"{perm.resource}:{perm.action}")
+
+        required = f"{self.resource}:{self.action}"
+        
+        # ADMIN has all permissions
+        user_roles = [ur.role.name for ur in current_user.roles if ur.role]
+        if "ADMIN" in user_roles:
+            return current_user
+            
+        if required not in user_permissions:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"You are not authorized to {self.action} {self.resource}.",
+            )
+        return current_user

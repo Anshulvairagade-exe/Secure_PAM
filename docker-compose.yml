@@ -1,0 +1,203 @@
+version: "3.9"
+
+# =============================================================================
+# SecurePAM Docker Compose
+# =============================================================================
+# Usage:
+#   Dev mode (mock providers):  docker compose up --build
+#   Lab mode (real services):   docker compose --profile lab up --build
+#   Monitoring:                 docker compose --profile monitoring up --build
+# =============================================================================
+
+services:
+  # ---------------------------------------------------------------------------
+  # Core Services (always started)
+  # ---------------------------------------------------------------------------
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: securepam-postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-securepam}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-securepam_dev_password}
+      POSTGRES_DB: ${POSTGRES_DB:-securepam}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-securepam}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - securepam-net
+
+  redis:
+    image: redis:7-alpine
+    container_name: securepam-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - securepam-net
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: securepam-backend
+    env_file:
+      - .env
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://${POSTGRES_USER:-securepam}:${POSTGRES_PASSWORD:-securepam_dev_password}@postgres:5432/${POSTGRES_DB:-securepam}
+      - REDIS_URL=redis://redis:6379/0
+    ports:
+      - "${BACKEND_PORT:-8000}:8000"
+    volumes:
+      - ./backend:/app
+      - recording_data:/data/recordings
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - securepam-net
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: securepam-frontend
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./frontend/src:/app/src
+      - ./frontend/public:/app/public
+      - ./frontend/index.html:/app/index.html
+    environment:
+      - VITE_API_URL=http://localhost:8000
+      - VITE_APP_NAME=SecurePAM
+    depends_on:
+      - backend
+    networks:
+      - securepam-net
+
+  # ---------------------------------------------------------------------------
+  # Lab Profile — Real infrastructure services
+  # ---------------------------------------------------------------------------
+
+  keycloak:
+    image: quay.io/keycloak/keycloak:24.0
+    container_name: securepam-keycloak
+    profiles: ["lab"]
+    environment:
+      KEYCLOAK_ADMIN: ${KEYCLOAK_ADMIN_USER:-admin}
+      KEYCLOAK_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:-admin}
+      KC_DB: postgres
+      KC_DB_URL: jdbc:postgresql://postgres:5432/${POSTGRES_DB:-securepam}
+      KC_DB_USERNAME: ${POSTGRES_USER:-securepam}
+      KC_DB_PASSWORD: ${POSTGRES_PASSWORD:-securepam_dev_password}
+    command: start-dev
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - securepam-net
+
+  guacd:
+    image: guacamole/guacd:1.5.5
+    container_name: securepam-guacd
+    profiles: ["lab"]
+    networks:
+      - securepam-net
+
+  guacamole:
+    image: guacamole/guacamole:1.5.5
+    container_name: securepam-guacamole
+    profiles: ["lab"]
+    environment:
+      GUACD_HOSTNAME: guacd
+      GUACD_PORT: 4822
+      POSTGRES_HOSTNAME: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_DATABASE: ${POSTGRES_DB:-securepam}
+      POSTGRES_USER: ${POSTGRES_USER:-securepam}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-securepam_dev_password}
+    ports:
+      - "8081:8080"
+    depends_on:
+      - guacd
+      - postgres
+    networks:
+      - securepam-net
+
+  vault:
+    image: hashicorp/vault:1.15
+    container_name: securepam-vault
+    profiles: ["lab"]
+    environment:
+      VAULT_DEV_ROOT_TOKEN_ID: ${VAULT_TOKEN:-dev-root-token}
+      VAULT_DEV_LISTEN_ADDRESS: 0.0.0.0:8200
+    cap_add:
+      - IPC_LOCK
+    ports:
+      - "8200:8200"
+    networks:
+      - securepam-net
+
+  # ---------------------------------------------------------------------------
+  # Monitoring Profile
+  # ---------------------------------------------------------------------------
+
+  prometheus:
+    image: prom/prometheus:v2.51.0
+    container_name: securepam-prometheus
+    profiles: ["monitoring"]
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./infrastructure/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    networks:
+      - securepam-net
+
+  grafana:
+    image: grafana/grafana:10.4.0
+    container_name: securepam-grafana
+    profiles: ["monitoring"]
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
+    ports:
+      - "3001:3000"
+    volumes:
+      - grafana_data:/var/lib/grafana
+    depends_on:
+      - prometheus
+    networks:
+      - securepam-net
+
+volumes:
+  postgres_data:
+  redis_data:
+  recording_data:
+  prometheus_data:
+  grafana_data:
+
+networks:
+  securepam-net:
+    driver: bridge
