@@ -32,7 +32,7 @@ from app.database.session import async_session_factory, engine  # noqa: E402
 from app.main import _seed_default_data, app  # noqa: E402
 
 
-@pytest_asyncio.fixture(scope="session", autouse=True)
+@pytest_asyncio.fixture(autouse=True)
 async def _prepared_database():
     """
     Build a clean schema via SQLAlchemy metadata and seed it with the same
@@ -40,11 +40,18 @@ async def _prepared_database():
     first DEV_MODE boot (by calling the exact same function, not a copy of
     its logic).
 
+    Function-scoped (re-run before EVERY test) rather than once per session:
+    once Phase 3 added tests that create/update/delete rows, a session-scoped
+    seed meant later tests' exact-count assertions (e.g. "total == 5 assets")
+    broke depending on what earlier tests in the same run had already
+    inserted. Each test now starts from an identical, pristine DB — the
+    per-test drop/create/reseed cost is small and correctness matters more.
+
     This intentionally does NOT go through Alembic — that migration path
     (upgrade from a truly empty DB, drift-check, downgrade) is exercised
     for real in test_migrations.py against a disposable database. Re-running
-    Alembic for every test session would only slow things down without
-    testing anything this fixture doesn't already cover for app behavior.
+    Alembic for every test would only slow things down without testing
+    anything this fixture doesn't already cover for app behavior.
     """
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.drop_all)

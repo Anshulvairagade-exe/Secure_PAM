@@ -1,11 +1,15 @@
 """
 RBAC foundation: RoleChecker / PermissionChecker dependency behavior.
 
-NOTE ON SCOPE: as of Phase 2, no HTTP endpoint actually applies
-RoleChecker/PermissionChecker yet (Assets/Policies/etc. CRUD — the first
-real role-gated routes — lands in a later phase). These tests exercise the
-dependency classes directly against real User rows loaded from the DB, so
-the RBAC mechanism itself is proven correct ahead of any route using it.
+Written in Phase 2, before any endpoint used these — kept because testing
+the mechanism directly (bypassing FastAPI's DI) is still useful in its own
+right. Since Phase 3, the real thing is also covered end-to-end at the
+HTTP level: see test_assets.py / test_applications.py / test_policies.py,
+which is what the Phase 3 spec asked for ("test actual HTTP endpoints").
+
+PermissionChecker.__call__ now takes `request` and `db` (it writes an
+ACCESS_DENIED audit event on denial — see app/core/deps.py), so calling it
+directly here requires passing both explicitly.
 """
 
 import pytest
@@ -42,7 +46,7 @@ async def test_role_checker_rejects_non_matching_role(db_session: AsyncSession):
 async def test_permission_checker_allows_held_permission(db_session: AsyncSession):
     approver = await _get_user(db_session, "approver")
     checker = PermissionChecker("approvals", "approve")
-    result = await checker(current_user=approver)
+    result = await checker(request=None, current_user=approver, db=db_session)
     assert result is approver
 
 
@@ -51,7 +55,7 @@ async def test_permission_checker_rejects_missing_permission(db_session: AsyncSe
     # Operators can create access requests but cannot approve them.
     checker = PermissionChecker("approvals", "approve")
     with pytest.raises(HTTPException) as exc_info:
-        await checker(current_user=operator)
+        await checker(request=None, current_user=operator, db=db_session)
     assert exc_info.value.status_code == 403
 
 
@@ -61,7 +65,7 @@ async def test_admin_bypasses_explicit_permission_grants(db_session: AsyncSessio
     in PermissionChecker."""
     admin = await _get_user(db_session, "admin")
     checker = PermissionChecker("vault", "manage")
-    result = await checker(current_user=admin)
+    result = await checker(request=None, current_user=admin, db=db_session)
     assert result is admin
 
 
@@ -69,5 +73,5 @@ async def test_auditor_cannot_approve(db_session: AsyncSession):
     auditor = await _get_user(db_session, "auditor")
     checker = PermissionChecker("approvals", "approve")
     with pytest.raises(HTTPException) as exc_info:
-        await checker(current_user=auditor)
+        await checker(request=None, current_user=auditor, db=db_session)
     assert exc_info.value.status_code == 403

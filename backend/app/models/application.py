@@ -22,24 +22,32 @@ class Application(Base, UUIDMixin, TimestampMixin):
     name: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
     description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
-    # Target configuration — stored server-side only
+    # Target configuration — stored server-side only. target_url is NEVER
+    # accepted as client input (see app/schemas/applications.py +
+    # app/core/ssrf.py) — it is always derived from hostname/port/protocol
+    # after SSRF validation, so a client can't smuggle a mismatched or
+    # credential-embedded URL past the hostname/port checks.
     target_url: Mapped[str] = mapped_column(
         String(2048), nullable=False,
-        comment="Full target URL — never exposed to frontend users"
+        comment="Derived server-side from hostname/port/protocol — never accepted as direct input"
     )
     protocol: Mapped[str] = mapped_column(
         String(10), nullable=False, default="HTTPS",
         comment="HTTP, HTTPS"
     )
-    target_host: Mapped[str] = mapped_column(String(255), nullable=False)
-    target_port: Mapped[int] = mapped_column(Integer, nullable=False, default=443)
+    hostname: Mapped[str] = mapped_column(String(255), nullable=False)
+    port: Mapped[int] = mapped_column(Integer, nullable=False, default=443)
 
     # Risk and access
-    risk_level: Mapped[str] = mapped_column(
-        String(10), nullable=False, default="MEDIUM",
+    environment: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="PRODUCTION", index=True,
+        comment="DEVELOPMENT, TEST, STAGING, PRODUCTION"
+    )
+    criticality: Mapped[str] = mapped_column(
+        String(10), nullable=False, default="MEDIUM", index=True,
         comment="LOW, MEDIUM, HIGH, CRITICAL"
     )
-    proxy_mode: Mapped[str] = mapped_column(
+    access_mode: Mapped[str] = mapped_column(
         String(20), nullable=False, default="STANDARD_PROXY",
         comment="STANDARD_PROXY, ISOLATED_BROWSER"
     )
@@ -61,14 +69,23 @@ class Application(Base, UUIDMixin, TimestampMixin):
         String(20), nullable=False, default="ACTIVE",
         comment="ACTIVE, INACTIVE, MAINTENANCE"
     )
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
 
     # Reference to assigned policy
     policy_id: Mapped[Optional[uuid.UUID]] = mapped_column(
         UUID(as_uuid=True), ForeignKey("policies.id", ondelete="SET NULL"), nullable=True
     )
 
+    # Audit trail — who registered/last changed this application
+    created_by: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    updated_by: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+
     # Soft delete
     is_deleted: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
 
     def __repr__(self) -> str:
-        return f"<Application {self.name} ({self.proxy_mode})>"
+        return f"<Application {self.name} ({self.access_mode})>"

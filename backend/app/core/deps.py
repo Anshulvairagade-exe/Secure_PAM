@@ -10,6 +10,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth import InvalidTokenError, get_token_validator
+from app.core.audit import client_ip, write_audit_log
 from app.database.session import async_session_factory
 from app.models.user import User, UserRole
 from app.models.role import Role
@@ -127,7 +128,9 @@ class RoleChecker:
 class PermissionChecker:
     """
     Dependency that checks if the current user has the required permission(s).
-    
+    Writes (and commits) an ACCESS_DENIED audit event on denial — see the
+    commit-before-raise note on app.core.audit.write_audit_log.
+
     Usage:
         @router.post("/assets", dependencies=[Depends(PermissionChecker("assets", "create"))])
     """
@@ -138,7 +141,9 @@ class PermissionChecker:
 
     async def __call__(
         self,
+        request: Request,
         current_user: User = Depends(get_current_active_user),
+        db: AsyncSession = Depends(get_db),
     ) -> User:
         user_permissions = set()
         for ur in current_user.roles:
@@ -147,13 +152,24 @@ class PermissionChecker:
                     user_permissions.add(f"{perm.resource}:{perm.action}")
 
         required = f"{self.resource}:{self.action}"
-        
+
         # ADMIN has all permissions
         user_roles = [ur.role.name for ur in current_user.roles if ur.role]
         if "ADMIN" in user_roles:
             return current_user
-            
+
         if required not in user_permissions:
+            await write_audit_log(
+                db,
+                actor=current_user,
+                action="ACCESS_DENIED",
+                target_type=self.resource,
+                source_ip=client_ip(request),
+                result="DENIED",
+                severity="MEDIUM",
+                metadata={"required_permission": required},
+            )
+            await db.commit()
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail=f"You are not authorized to {self.action} {self.resource}.",

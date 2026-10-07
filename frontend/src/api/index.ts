@@ -11,11 +11,23 @@ import type {
   DashboardSummary,
   DashboardActivity,
   Asset,
+  AssetInput,
   Application,
+  ApplicationInput,
   Policy,
+  PolicyInput,
   AuditLog,
   DetailedHealth,
+  PaginatedResponse,
 } from '@/types';
+
+export interface ListParams {
+  page?: number;
+  page_size?: number;
+  sort_by?: string;
+  sort_order?: 'asc' | 'desc';
+  [key: string]: string | number | boolean | undefined;
+}
 
 // --- Auth ---
 
@@ -43,17 +55,17 @@ export const dashboardApi = {
 // --- Assets ---
 
 export const assetsApi = {
-  list: () =>
-    apiClient.get<Asset[]>('/assets').then(r => r.data),
+  list: (params?: ListParams) =>
+    apiClient.get<PaginatedResponse<Asset>>('/assets', { params }).then(r => r.data),
 
   get: (id: string) =>
     apiClient.get<Asset>(`/assets/${id}`).then(r => r.data),
 
-  create: (data: Partial<Asset>) =>
+  create: (data: Partial<AssetInput>) =>
     apiClient.post<Asset>('/assets', data).then(r => r.data),
 
-  update: (id: string, data: Partial<Asset>) =>
-    apiClient.put<Asset>(`/assets/${id}`, data).then(r => r.data),
+  update: (id: string, data: Partial<AssetInput>) =>
+    apiClient.patch<Asset>(`/assets/${id}`, data).then(r => r.data),
 
   delete: (id: string) =>
     apiClient.delete(`/assets/${id}`).then(r => r.data),
@@ -62,17 +74,17 @@ export const assetsApi = {
 // --- Applications ---
 
 export const applicationsApi = {
-  list: () =>
-    apiClient.get<Application[]>('/applications').then(r => r.data),
+  list: (params?: ListParams) =>
+    apiClient.get<PaginatedResponse<Application>>('/applications', { params }).then(r => r.data),
 
   get: (id: string) =>
     apiClient.get<Application>(`/applications/${id}`).then(r => r.data),
 
-  create: (data: Partial<Application>) =>
+  create: (data: Partial<ApplicationInput>) =>
     apiClient.post<Application>('/applications', data).then(r => r.data),
 
-  update: (id: string, data: Partial<Application>) =>
-    apiClient.put<Application>(`/applications/${id}`, data).then(r => r.data),
+  update: (id: string, data: Partial<ApplicationInput>) =>
+    apiClient.patch<Application>(`/applications/${id}`, data).then(r => r.data),
 
   delete: (id: string) =>
     apiClient.delete(`/applications/${id}`).then(r => r.data),
@@ -81,17 +93,20 @@ export const applicationsApi = {
 // --- Policies ---
 
 export const policiesApi = {
-  list: () =>
-    apiClient.get<Policy[]>('/policies').then(r => r.data),
+  list: (params?: ListParams) =>
+    apiClient.get<PaginatedResponse<Policy>>('/policies', { params }).then(r => r.data),
 
   get: (id: string) =>
     apiClient.get<Policy>(`/policies/${id}`).then(r => r.data),
 
-  create: (data: Partial<Policy>) =>
+  create: (data: Partial<PolicyInput>) =>
     apiClient.post<Policy>('/policies', data).then(r => r.data),
 
-  update: (id: string, data: Partial<Policy>) =>
-    apiClient.put<Policy>(`/policies/${id}`, data).then(r => r.data),
+  update: (id: string, data: Partial<PolicyInput>) =>
+    apiClient.patch<Policy>(`/policies/${id}`, data).then(r => r.data),
+
+  delete: (id: string) =>
+    apiClient.delete(`/policies/${id}`).then(r => r.data),
 };
 
 // --- Audit ---

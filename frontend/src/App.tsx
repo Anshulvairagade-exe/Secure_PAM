@@ -4,6 +4,9 @@ import ProtectedRoute from '@/components/ProtectedRoute';
 import AppLayout from '@/layouts/AppLayout';
 import Login from '@/pages/Login';
 import Dashboard from '@/pages/Dashboard';
+import Assets from '@/pages/Assets';
+import Applications from '@/pages/Applications';
+import Policies from '@/pages/Policies';
 import ComingSoon from '@/pages/ComingSoon';
 import NotFound from '@/pages/NotFound';
 
@@ -22,8 +25,8 @@ export default function App() {
         <Route path="/" element={<Dashboard />} />
         <Route path="/access-requests" element={<ComingSoon title="Access Requests" phase="Phase 5" />} />
         <Route path="/sessions" element={<ComingSoon title="My Sessions" phase="Phase 8" />} />
-        <Route path="/assets" element={<ComingSoon title="Assets" phase="Phase 4" />} />
-        <Route path="/applications" element={<ComingSoon title="Applications" phase="Phase 4" />} />
+        <Route path="/assets" element={<Assets />} />
+        <Route path="/applications" element={<Applications />} />
         <Route
           path="/approvals"
           element={
@@ -59,8 +62,8 @@ export default function App() {
         <Route
           path="/policies"
           element={
-            <ProtectedRoute requiredRoles={['ADMIN']}>
-              <ComingSoon title="Policies" phase="Phase 4" />
+            <ProtectedRoute requiredRoles={['ADMIN', 'APPROVER', 'AUDITOR']}>
+              <Policies />
             </ProtectedRoute>
           }
         />

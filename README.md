@@ -6,9 +6,10 @@ through: authenticate → authorize → evaluate risk → approve if required �
 grant JIT access → retrieve credentials → establish a monitored/recorded
 session → revoke on expiry → audit everything.
 
-**Current phase: 2 (foundation hardening).** Login, RBAC, the dashboard,
-health checks, and the full data model exist and are tested. Asset/
-Application/Policy management, the risk/approval/JIT engines, and the
+**Current phase: 3 (Assets, Applications, Policies & real RBAC).** Login,
+RBAC, the dashboard, health checks, the full data model, and now Asset/
+Application/Policy management (CRUD + enforcement + audit logging) exist
+and are tested end-to-end. The risk/approval/JIT engines and the
 RDP/SSH/web gateways are not built yet — see [Status](#status).
 
 ## Architecture
@@ -36,6 +37,104 @@ answers *"who is this?"*. SecurePAM's own RBAC tables (`roles`,
 `permissions`, `user_roles`) always answer *"what can they do?"* — a
 token's own claimed roles are never trusted for that decision (see
 `app/auth/base.py` and `tests/test_auth.py::test_token_claimed_roles_are_not_trusted`).
+
+## Asset / Application / Policy management
+
+**Assets** (`/api/v1/assets`) are registered infrastructure targets
+(`WINDOWS_SERVER`, `WINDOWS_WORKSTATION`, `LINUX_SERVER`, `UNIX_SERVER`,
+`NETWORK_DEVICE`, `OTHER`; protocols `RDP`/`SSH`/`HTTPS`/`HTTP`). No
+credentials live on this model — that's a future OpenBao/Vault phase
+(`app/models/vault_ref.py` already has the reference table).
+
+**Applications** (`/api/v1/applications`) are registered internal web
+apps. **There is no `/proxy?url=...` and there never will be** —
+`target_url` isn't even a field clients can set; it's derived
+server-side from `hostname`/`port`/`protocol` after SSRF validation
+(`app/core/ssrf.py`). That validator blocks loopback, link-local
+(which also covers every major cloud's `169.254.169.254` metadata
+endpoint), the literal `localhost`, and malformed hosts — but
+deliberately does NOT block private-network IPs or internal DNS names
+like `admin.internal`, since registering exactly those targets is the
+whole point of a PAM web gateway. True DNS-rebinding defense (resolve +
+pin at connection time) is a future Web Gateway concern, not CRUD
+validation — see the module docstring for the full reasoning.
+
+**Policies** (`/api/v1/policies`) are pure data for the future Risk/
+Policy Engine — no decision logic lives in the frontend or in this CRUD
+layer. `allowed_roles`/`allowed_asset_types`/`allowed_environments`/
+`allowed_protocols`/`allowed_days` are Postgres `ARRAY` columns where
+empty/null means "no restriction on this dimension."
+
+All three: soft-delete only (never hard-delete — `is_deleted`), PATCH
+semantics for updates (partial body, `exclude_unset`), and deletion is
+refused with `409` while any Session still actively references the
+Asset/Application (`CREATED`/`STARTING`/`ACTIVE`/`TERMINATING`).
+
+### RBAC permissions
+
+Enforced via `PermissionChecker` (`app/core/deps.py`) on every endpoint
+below — never via frontend route visibility. A denial (`403`) writes an
+`ACCESS_DENIED` audit event before the exception propagates.
+
+| Role | assets | applications | policies |
+|---|---|---|---|
+| ADMIN | full CRUD | full CRUD | full CRUD |
+| OPERATOR | read | read | — |
+| APPROVER | read | read | read |
+| AUDITOR | read | read | read |
+
+### API endpoints
+
+```
+GET    /api/v1/assets              ?page,page_size,sort_by,sort_order,environment,criticality,asset_type,enabled,search
+POST   /api/v1/assets
+GET    /api/v1/assets/{id}
+PATCH  /api/v1/assets/{id}
+DELETE /api/v1/assets/{id}          -> 204, soft delete; 409 if active sessions reference it
+
+GET    /api/v1/applications         ?page,page_size,sort_by,sort_order,environment,criticality,access_mode,enabled,search
+POST   /api/v1/applications
+GET    /api/v1/applications/{id}
+PATCH  /api/v1/applications/{id}
+DELETE /api/v1/applications/{id}
+
+GET    /api/v1/policies             ?page,page_size,sort_by,sort_order,enabled,risk_threshold
+POST   /api/v1/policies
+GET    /api/v1/policies/{id}
+PATCH  /api/v1/policies/{id}
+DELETE /api/v1/policies/{id}
+```
+
+Every list endpoint uses the shared `app/core/pagination.py` utilities
+(`apply_sorting` validates `sort_by` against an explicit per-endpoint
+allowlist — never an arbitrary client-controlled column — before
+`paginate` applies LIMIT/OFFSET and returns `{items, total, page,
+page_size, pages}`).
+
+### Example: registering a production asset
+
+```bash
+curl -X POST http://localhost:8000/api/v1/assets \
+  -H "Authorization: Bearer $ADMIN_TOKEN" -H "Content-Type: application/json" \
+  -d '{"name":"LINUX-PROD-02","hostname":"prod02.internal","ip_address":"10.0.1.30",
+       "port":22,"protocol":"SSH","asset_type":"LINUX_SERVER",
+       "environment":"PRODUCTION","criticality":"HIGH","approval_required":true}'
+```
+
+### Security considerations
+
+- **Mass assignment**: `id`/`created_at`/`updated_at`/`created_by`/
+  `updated_by`/`is_deleted` are never fields on any Create/Update
+  schema — they're always server-set.
+- **404 vs disclosure**: a soft-deleted or nonexistent resource both
+  return a plain `404` — a non-admin never learns a deleted resource
+  ever existed.
+- **IDOR**: not applicable in the traditional per-owner sense — these
+  are organization-wide resources gated purely by role/permission, not
+  by a `user_id` the client could swap.
+- **Never trust the frontend** for role, user ID, permissions, target
+  URL, or policy decisions — every one of those is re-derived or
+  re-checked server-side on every request.
 
 ## Tech stack
 
@@ -86,7 +185,9 @@ uvicorn app.main:app --reload --port 8000
 - Swagger: http://localhost:8000/docs (DEV_MODE only)
 - `DEV_MODE=true` seeds four users on first boot: `admin/admin123`,
   `operator/operator123`, `approver/approver123`, `auditor/auditor123`
-  (plus 5 sample assets, 3 applications, 4 policies).
+  (plus 5 sample assets, 3 applications, 4 policies — including a
+  "Production Linux Access" policy matching the OPERATOR/SSH/PRODUCTION
+  example from the Phase 3 spec).
 
 ### 5. Frontend
 
@@ -197,19 +298,38 @@ behavior, so orchestrators can route around this instance.
 in `.env` must include the *exact* origin the browser uses (`http://localhost:3000`,
 not `http://127.0.0.1:3000` — they're different origins to a browser's CORS checks).
 
+**A migration's `downgrade()` fails with a constraint-name error on
+`op.drop_constraint(None, ...)`** — unlike `op.create_foreign_key(None, ...)`
+(where `None` lets Alembic generate a name), `drop_constraint` needs the
+*real* name. Find it with
+`SELECT conname FROM pg_constraint WHERE conrelid = '<table>'::regclass AND contype = 'f'`
+— Postgres's default is `<table>_<column>_fkey` unless a naming
+convention is configured (none is, in this codebase).
+
+**A Pydantic schema with an `Enum` field stores `"AssetType.WINDOWS_SERVER"`
+instead of `"WINDOWS_SERVER"`** — set `model_config = ConfigDict(use_enum_values=True)`
+on the schema (every schema in `app/schemas/{assets,applications,policies}.py`
+already does this) so `.model_dump()` yields plain strings before they
+reach the ORM constructor.
+
 ## Status
 
 Implemented and tested: project scaffolding, Docker Compose, all 17
 SQLAlchemy models with full FK referential integrity, Alembic migrations
-(verified from an empty DB), DevAuth login/`/me`, RBAC foundation
-(`RoleChecker`/`PermissionChecker` — not yet wired to any endpoint since
-none exist to gate), dashboard (real DB-backed counts only), structured
-logging + request IDs, consistent API error envelope, `/health`,
-`/health/live`, `/health/ready`, pagination/sorting utilities, React
-frontend shell (routing, auth context, protected routes, role-based nav).
+(verified from an empty DB), DevAuth login/`/me`, dashboard (real
+DB-backed counts only), structured logging + request IDs, consistent API
+error envelope, `/health`, `/health/live`, `/health/ready`,
+pagination/sorting utilities, React frontend shell (routing, auth
+context, protected routes, role-based nav) — and, as of Phase 3, full
+Asset/Application/Policy CRUD with real RBAC enforcement
+(`PermissionChecker` now actually gates every endpoint above, writing an
+audit event on both success and denial), SSRF-safe Application
+registration, and real Assets/Applications/Policies pages in the
+frontend (search, filter, sort, pagination, create/edit/delete — no
+fake data anywhere).
 
 Not implemented: Keycloak/OIDC, Vault/OpenBao, Guacamole (RDP), SSH
-gateway, web reverse proxy, isolated browser, risk engine, policy engine,
-approval workflow, JIT access, session recording, Wazuh/SIEM, Assets/
-Applications/Policies/Users/Roles CRUD (UI currently shows an honest
-"planned for Phase N" placeholder for each).
+gateway, web reverse proxy, isolated browser, risk engine, approval
+workflow, JIT access, session recording, Wazuh/SIEM, Users/Roles CRUD
+(UI still shows an honest "planned for Phase N" placeholder for those
+and for Access Requests/Sessions/Recordings/Audit Logs/Risk Center/Vault).

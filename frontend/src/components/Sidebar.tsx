@@ -36,7 +36,7 @@ const NAV_ITEMS: NavItem[] = [
   { label: 'Recordings', path: '/recordings', icon: Video, roles: ['ADMIN', 'AUDITOR'] },
   { label: 'Audit Logs', path: '/audit', icon: ScrollText, roles: ['ADMIN', 'AUDITOR'] },
   { label: 'Risk Center', path: '/risk', icon: Gauge, roles: ['ADMIN', 'APPROVER', 'AUDITOR'] },
-  { label: 'Policies', path: '/policies', icon: ShieldCheck, roles: ['ADMIN'] },
+  { label: 'Policies', path: '/policies', icon: ShieldCheck, roles: ['ADMIN', 'APPROVER', 'AUDITOR'] },
   { label: 'Vault', path: '/vault', icon: KeyRound, roles: ['ADMIN'] },
   { label: 'Users', path: '/users', icon: Users, roles: ['ADMIN'] },
   { label: 'Roles', path: '/roles', icon: UserCog, roles: ['ADMIN'] },

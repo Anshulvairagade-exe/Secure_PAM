@@ -58,37 +58,55 @@ export interface DashboardActivity {
 }
 
 // --- Assets ---
+export type AssetType =
+  | 'WINDOWS_SERVER'
+  | 'WINDOWS_WORKSTATION'
+  | 'LINUX_SERVER'
+  | 'UNIX_SERVER'
+  | 'NETWORK_DEVICE'
+  | 'OTHER';
+
 export interface Asset {
   id: string;
   name: string;
   hostname: string;
   ip_address: string;
   port: number;
-  protocol: 'RDP' | 'SSH';
-  asset_type: 'WINDOWS' | 'LINUX';
+  protocol: 'RDP' | 'SSH' | 'HTTPS' | 'HTTP';
+  asset_type: AssetType;
   environment: Environment;
   criticality: Criticality;
   description?: string;
   status: EntityStatus;
+  enabled: boolean;
   owner?: string;
   recording_required: boolean;
   approval_required: boolean;
   jit_required: boolean;
+  policy_id?: string;
   created_at: string;
   updated_at: string;
+  created_by?: string;
+  updated_by?: string;
 }
 
+export type AssetInput = Omit<Asset, 'id' | 'status' | 'created_at' | 'updated_at' | 'created_by' | 'updated_by'>;
+
 // --- Applications ---
+export type AccessMode = 'STANDARD_PROXY' | 'ISOLATED_BROWSER';
+
 export interface Application {
   id: string;
   name: string;
   description?: string;
-  target_url: string; // Only visible to admins
+  target_url: string; // Always server-derived — never sent by the client
   protocol: 'HTTP' | 'HTTPS';
-  target_host: string;
-  target_port: number;
-  risk_level: Criticality;
-  proxy_mode: 'STANDARD_PROXY' | 'ISOLATED_BROWSER';
+  hostname: string;
+  port: number;
+  environment: Environment;
+  criticality: Criticality;
+  access_mode: AccessMode;
+  enabled: boolean;
   approval_required: boolean;
   mfa_required: boolean;
   recording_required: boolean;
@@ -96,10 +114,18 @@ export interface Application {
   upload_allowed: boolean;
   clipboard_allowed: boolean;
   session_timeout: number;
+  policy_id?: string;
   status: EntityStatus;
   created_at: string;
   updated_at: string;
+  created_by?: string;
+  updated_by?: string;
 }
+
+export type ApplicationInput = Omit<
+  Application,
+  'id' | 'target_url' | 'status' | 'created_at' | 'updated_at' | 'created_by' | 'updated_by'
+>;
 
 // --- Access Requests ---
 export interface AccessRequest {
@@ -214,26 +240,45 @@ export interface AuditLog {
 }
 
 // --- Policies ---
+export type RoleName = 'ADMIN' | 'OPERATOR' | 'APPROVER' | 'AUDITOR';
+export type DayOfWeek = 'MON' | 'TUE' | 'WED' | 'THU' | 'FRI' | 'SAT' | 'SUN';
+
 export interface Policy {
   id: string;
   name: string;
   description?: string;
+  enabled: boolean;
+
+  allowed_roles?: RoleName[] | null;
+  allowed_asset_types?: AssetType[] | null;
+  allowed_environments?: Environment[] | null;
+  allowed_protocols?: string[] | null;
+  allowed_days?: DayOfWeek[] | null;
+  business_hours_only: boolean;
+
   risk_threshold: RiskLevel;
   min_risk_score: number;
-  approval_required: boolean;
+
+  require_approval: boolean;
   jit_required: boolean;
-  mfa_required: boolean;
-  recording_required: boolean;
-  session_timeout: number;
+  require_mfa: boolean;
+  require_recording: boolean;
+
+  max_session_duration: number;
   download_allowed: boolean;
   upload_allowed: boolean;
   clipboard_allowed: boolean;
+
   auto_approve: boolean;
   deny_access: boolean;
-  is_active: boolean;
+
   created_at: string;
   updated_at: string;
+  created_by?: string;
+  updated_by?: string;
 }
+
+export type PolicyInput = Omit<Policy, 'id' | 'created_at' | 'updated_at' | 'created_by' | 'updated_by'>;
 
 // --- Health ---
 export interface HealthCheck {
