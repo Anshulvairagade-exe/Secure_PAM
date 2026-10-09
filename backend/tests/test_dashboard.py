@@ -1,7 +1,13 @@
 """Dashboard summary/activity endpoints — real DB-backed counts, never fake numbers."""
 
 from httpx import AsyncClient
-
+from sqlalchemy import select
+from app.core.security import generate_request_number, generate_session_number
+from app.models.access_request import AccessRequest
+from app.models.asset import Asset
+from app.models.recording import Recording
+from app.models.session import Session
+from app.models.user import User
 from tests.conftest import auth_header
 
 
@@ -38,3 +44,99 @@ async def test_dashboard_activity_limit_is_capped(client: AsyncClient, admin_tok
         "/api/v1/dashboard/activity", params={"limit": 999}, headers=auth_header(admin_token)
     )
     assert resp.status_code == 200
+
+
+async def _create_recording(
+    db_session,
+    *,
+    user_id,
+    asset_id,
+    file_size,
+    status="COMPLETED",
+):
+    """Create a valid session and its recording for dashboard tests."""
+    request = AccessRequest(
+        request_number=generate_request_number(),
+        user_id=user_id,
+        asset_id=asset_id,
+        protocol="SSH",
+        reason="Dashboard recording-storage test",
+        requested_duration=30,
+        status="ACTIVE",
+        approval_required=False,
+        jit_required=False,
+        mfa_required=False,
+        recording_required=True,
+    )
+    db_session.add(request)
+    await db_session.flush()
+
+    session = Session(
+        session_number=generate_session_number(),
+        user_id=user_id,
+        asset_id=asset_id,
+        protocol="SSH",
+        status="COMPLETED",
+        request_id=request.id,
+    )
+    db_session.add(session)
+    await db_session.flush()
+
+    recording = Recording(
+        session_id=session.id,
+        recording_type="TERMINAL",
+        status=status,
+        file_size=file_size,
+    )
+    db_session.add(recording)
+    await db_session.flush()
+    return recording
+
+
+async def test_dashboard_storage_sums_non_deleted_recordings(
+    client: AsyncClient,
+    admin_token: str,
+    db_session,
+):
+    
+
+    user = (
+        await db_session.execute(select(User).where(User.username == "admin"))
+    ).scalar_one()
+    asset = (
+        await db_session.execute(select(Asset).where(Asset.name == "LINUX-DEV-01"))
+    ).scalar_one()
+
+    await _create_recording(
+        db_session, user_id=user.id, asset_id=asset.id, file_size=1024 * 1024
+    )
+    await _create_recording(
+        db_session, user_id=user.id, asset_id=asset.id, file_size=2 * 1024 * 1024
+    )
+    await _create_recording(
+        db_session,
+        user_id=user.id,
+        asset_id=asset.id,
+        file_size=50 * 1024 * 1024,
+        status="DELETED",
+    )
+    await db_session.commit()
+
+    response = await client.get(
+        "/api/v1/dashboard/summary", headers=auth_header(admin_token)
+    )
+
+    assert response.status_code == 200
+    assert response.json()["recording_storage_mb"] == 3.0
+
+
+async def test_dashboard_storage_is_zero_without_recordings(
+    client: AsyncClient,
+    admin_token: str,
+):
+    response = await client.get(
+        "/api/v1/dashboard/summary", headers=auth_header(admin_token)
+    )
+
+    assert response.status_code == 200
+    assert response.json()["recording_storage_mb"] == 0.0
