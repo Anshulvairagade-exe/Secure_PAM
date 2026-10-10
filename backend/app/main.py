@@ -375,7 +375,7 @@ async def _seed_default_data():
                 "email": "auditor@securepam.local",
                 "full_name": "Bob Auditor",
                 "password": "auditor123",
-                "mfa_enabled": False,
+                "mfa_enabled": True,
                 "role": auditor_role,
             },
         ]
