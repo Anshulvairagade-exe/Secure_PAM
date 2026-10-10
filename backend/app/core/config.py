@@ -39,6 +39,7 @@ class Settings(BaseSettings):
 
     # --- Identity Provider ---
     KEYCLOAK_URL: str = "http://keycloak:8080"
+    KEYCLOAK_INTERNAL_URL: str = ""
     KEYCLOAK_REALM: str = "securepam"
     KEYCLOAK_CLIENT_ID: str = "securepam-app"
     KEYCLOAK_CLIENT_SECRET: str = ""
@@ -89,7 +90,11 @@ class Settings(BaseSettings):
 
     @property
     def KEYCLOAK_JWKS_URL(self) -> str:
-        return f"{self.KEYCLOAK_ISSUER_URL}/protocol/openid-connect/certs"
+        base_url = self.KEYCLOAK_INTERNAL_URL or self.KEYCLOAK_URL
+        return (
+            f"{base_url}/realms/{self.KEYCLOAK_REALM}"
+            "/protocol/openid-connect/certs"
+        )
 
     @property
     def KEYCLOAK_TOKEN_URL(self) -> str:

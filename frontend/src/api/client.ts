@@ -1,11 +1,13 @@
+
 /**
- * Axios API client with authentication interceptor.
+ * Axios API client with Keycloak authentication.
  *
- * Automatically attaches JWT token to requests.
- * Handles 401 responses by redirecting to login.
+ * Access tokens remain in memory and are attached to API requests.
+ * SecurePAM's backend validates tokens and enforces permissions.
  */
 
 import axios, { AxiosError, InternalAxiosRequestConfig } from 'axios';
+import keycloak from '@/auth/keycloak';
 
 const API_BASE_URL = import.meta.env.VITE_API_URL || '';
 
@@ -17,30 +19,43 @@ const apiClient = axios.create({
   timeout: 30000,
 });
 
-// Request interceptor — attach auth token
+// Attach a current Keycloak access token to API requests.
+
 apiClient.interceptors.request.use(
-  (config: InternalAxiosRequestConfig) => {
-    const token = localStorage.getItem('access_token');
-    if (token && config.headers) {
-      config.headers.Authorization = `Bearer ${token}`;
+  async (config: InternalAxiosRequestConfig) => {
+    if (keycloak.authenticated) {
+      try {
+        await keycloak.updateToken(30);
+
+        if (keycloak.token && config.headers) {
+          config.headers.Authorization = `Bearer ${keycloak.token}`;
+        }
+      } catch (error) {
+        // Do not send a request with a token that could not be refreshed.
+        if (window.location.pathname !== '/login') {
+          window.location.href = '/login';
+        }
+
+        return Promise.reject(error);
+      }
     }
+
     return config;
   },
   (error) => Promise.reject(error)
 );
 
-// Response interceptor — handle auth errors
+// Handle API authentication errors without creating redirect loops.
 apiClient.interceptors.response.use(
   (response) => response,
   (error: AxiosError) => {
-    if (error.response?.status === 401) {
-      // Clear stored tokens and redirect to login
-      localStorage.removeItem('access_token');
-      localStorage.removeItem('refresh_token');
-      if (window.location.pathname !== '/login') {
-        window.location.href = '/login';
-      }
+    if (
+      error.response?.status === 401 &&
+      window.location.pathname !== '/login'
+    ) {
+      window.location.href = '/login';
     }
+
     return Promise.reject(error);
   }
 );
