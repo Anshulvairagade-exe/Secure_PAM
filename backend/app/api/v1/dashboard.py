@@ -5,7 +5,7 @@ All statistics are computed server-side.
 No hard-coded numbers.
 """
 
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends
 from sqlalchemy import and_, func, select
@@ -40,10 +40,10 @@ async def get_dashboard_summary(
         )
     ) or 0
 
-    # Pending requests
+    # Requests awaiting human approval
     pending_requests = await db.scalar(
         select(func.count()).select_from(AccessRequest).where(
-            AccessRequest.status == "PENDING"
+            AccessRequest.status == "APPROVAL_REQUIRED"
         )
     ) or 0
 

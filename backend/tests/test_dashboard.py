@@ -28,6 +28,48 @@ async def test_dashboard_summary_reflects_seeded_assets(client: AsyncClient, adm
     assert isinstance(body["recording_storage_mb"], float)
 
 
+async def test_dashboard_counts_requests_awaiting_approval(
+    client: AsyncClient,
+    admin_token: str,
+    db_session,
+):
+    user = (
+        await db_session.execute(
+            select(User).where(User.username == "admin")
+        )
+    ).scalar_one()
+
+    asset = (
+        await db_session.execute(
+            select(Asset).where(Asset.name == "LINUX-DEV-01")
+        )
+    ).scalar_one()
+
+    request = AccessRequest(
+        request_number=generate_request_number(),
+        user_id=user.id,
+        asset_id=asset.id,
+        protocol="SSH",
+        reason="Dashboard approval-count regression test",
+        requested_duration=30,
+        status="APPROVAL_REQUIRED",
+        approval_required=True,
+        jit_required=False,
+        mfa_required=False,
+        recording_required=True,
+    )
+    db_session.add(request)
+    await db_session.commit()
+
+    response = await client.get(
+        "/api/v1/dashboard/summary",
+        headers=auth_header(admin_token),
+    )
+
+    assert response.status_code == 200
+    assert response.json()["pending_requests"] == 1
+
+
 async def test_dashboard_activity_requires_authentication(client: AsyncClient):
     resp = await client.get("/api/v1/dashboard/activity")
     assert resp.status_code == 401
