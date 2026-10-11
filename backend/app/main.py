@@ -12,7 +12,11 @@ import asyncio
 import time
 import uuid
 from contextlib import asynccontextmanager, suppress
-
+from app.core.rate_limit import (
+    RateLimitUnavailable,
+    RedisRateLimiter,
+    client_identifier,
+)
 import structlog
 from fastapi import FastAPI, HTTPException, Request, Response, status
 from fastapi.exceptions import RequestValidationError
@@ -81,7 +85,7 @@ async def lifespan(app: FastAPI):
     ):
         mfa_sync_task = asyncio.create_task(_keycloak_mfa_sync_loop())
         logger.info("keycloak_mfa_sync_started")
-
+    app.state.rate_limiter = RedisRateLimiter(settings.REDIS_URL)
     try:
         yield
     finally:
@@ -89,7 +93,7 @@ async def lifespan(app: FastAPI):
             mfa_sync_task.cancel()
             with suppress(asyncio.CancelledError):
                 await mfa_sync_task
-
+        await app.state.rate_limiter.close()
         # Shutdown
         await close_db()
         logger.info("app_shutdown", app=settings.APP_NAME)
@@ -137,7 +141,69 @@ async def request_context_middleware(request: Request, call_next):
 
     start = time.monotonic()
     try:
-        response: Response = await call_next(request)
+        api_prefix = settings.API_V1_PREFIX.rstrip("/")
+        is_api_request = request.url.path.startswith(f"{api_prefix}/")
+        is_auth_login = (
+            request.url.path == f"{api_prefix}/auth/login"
+            and request.method == "POST"
+        )
+
+        if is_api_request and settings.ENVIRONMENT != "test":
+            limiter = getattr(request.app.state, "rate_limiter", None)
+
+            if limiter is None:
+                raise RateLimitUnavailable()
+
+            bucket = "auth" if is_auth_login else "api"
+            limit = (
+                settings.RATE_LIMIT_AUTH_PER_MINUTE
+                if is_auth_login
+                else settings.RATE_LIMIT_PER_MINUTE
+            )
+            client_id = client_identifier(request)
+
+            try:
+                allowed, retry_after = await limiter.check(
+                    key=f"securepam:rate:{bucket}:{client_id}",
+                    limit=limit,
+                    window_seconds=60,
+                )
+            except RateLimitUnavailable:
+                response = JSONResponse(
+                    status_code=503,
+                    content={
+                        "detail": "Rate limiting is temporarily unavailable. Please retry shortly.",
+                        "error_code": "RATE_LIMIT_UNAVAILABLE",
+                        "errors": None,
+                    },
+                    headers={"Retry-After": "1"},
+                )
+            else:
+                if not allowed:
+                    response = JSONResponse(
+                        status_code=429,
+                        content={
+                            "detail": "Too many requests. Please try again later.",
+                            "error_code": "RATE_LIMIT_EXCEEDED",
+                            "errors": None,
+                        },
+                        headers={"Retry-After": str(retry_after)},
+                    )
+                else:
+                    response = await call_next(request)
+        else:
+            response = await call_next(request)
+
+    except RateLimitUnavailable:
+        response = JSONResponse(
+            status_code=503,
+            content={
+                "detail": "Rate limiting is temporarily unavailable. Please retry shortly.",
+                "error_code": "RATE_LIMIT_UNAVAILABLE",
+                "errors": None,
+            },
+            headers={"Retry-After": "1"},
+        )
     except Exception:
         duration_ms = round((time.monotonic() - start) * 1000, 2)
         logger.error("request_failed", duration_ms=duration_ms, exc_info=True)
