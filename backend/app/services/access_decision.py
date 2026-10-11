@@ -302,11 +302,26 @@ class AccessDecisionService:
     ) -> AccessRequest:
         if approval.status != "PENDING":
             raise InvalidTransitionError(approval.status, "APPROVED")
-        if approver.id == access_request.user_id:
-            raise SelfApprovalError("A requester cannot approve their own access request.")
-        check_transition(access_request.status, "APPROVED")
 
         now = datetime.now(timezone.utc)
+
+        # A request cannot be approved after its approval deadline.
+        if access_request.expires_at is not None:
+            deadline = access_request.expires_at
+            if deadline.tzinfo is None:
+                deadline = deadline.replace(tzinfo=timezone.utc)
+            if deadline <= now:
+                raise InvalidTransitionError(
+                    access_request.status, "EXPIRED"
+                )
+
+        if approver.id == access_request.user_id:
+            raise SelfApprovalError(
+                "A requester cannot approve their own access request."
+            )
+
+        check_transition(access_request.status, "APPROVED")
+
         approval.status = "APPROVED"
         approval.approver_id = approver.id
         approval.comment = comment
@@ -320,33 +335,54 @@ class AccessDecisionService:
 
         audit_kwargs = dict(
             target_type=_target_type(access_request.asset_id),
-            target_id=str(access_request.asset_id or access_request.application_id),
+            target_id=str(
+                access_request.asset_id or access_request.application_id
+            ),
             request_id=access_request.id,
             source_ip=source_ip,
         )
         await write_audit_log(
-            db, actor=approver, action="APPROVAL_GRANTED", result="SUCCESS", severity="INFO",
+            db, actor=approver, action="APPROVAL_GRANTED",
+            result="SUCCESS", severity="INFO",
             metadata={"comment": comment}, **audit_kwargs,
         )
 
         duration = access_request.requested_duration
-        if access_request.policy_decision and access_request.policy_decision.get("max_duration") is not None:
-            duration = min(duration, access_request.policy_decision["max_duration"])
+        if (
+            access_request.policy_decision
+            and access_request.policy_decision.get("max_duration") is not None
+        ):
+            duration = min(
+                duration,
+                access_request.policy_decision["max_duration"],
+            )
 
         jit = await self._jit.grant(
-            db, request_id=access_request.id, user_id=access_request.user_id,
-            asset_id=access_request.asset_id, application_id=access_request.application_id,
-            protocol=access_request.protocol, duration_minutes=duration, created_by=approver.id,
+            db,
+            request_id=access_request.id,
+            user_id=access_request.user_id,
+            asset_id=access_request.asset_id,
+            application_id=access_request.application_id,
+            protocol=access_request.protocol,
+            duration_minutes=duration,
+            created_by=approver.id,
         )
+
         access_request.status = "ACTIVE"
         await write_audit_log(
-            db, actor=approver, action="JIT_GRANTED", result="SUCCESS", severity="INFO",
-            metadata={"expires_at": jit.expires_at.isoformat(), "duration_minutes": duration}, **audit_kwargs,
+            db, actor=approver, action="JIT_GRANTED",
+            result="SUCCESS", severity="INFO",
+            metadata={
+                "expires_at": jit.expires_at.isoformat(),
+                "duration_minutes": duration,
+            },
+            **audit_kwargs,
         )
 
         await db.commit()
         await db.refresh(access_request)
         return access_request
+
 
     async def reject(
         self, db: AsyncSession, *, approval: Approval, access_request: AccessRequest,
@@ -354,11 +390,26 @@ class AccessDecisionService:
     ) -> AccessRequest:
         if approval.status != "PENDING":
             raise InvalidTransitionError(approval.status, "REJECTED")
-        if approver.id == access_request.user_id:
-            raise SelfApprovalError("A requester cannot reject their own access request.")
-        check_transition(access_request.status, "REJECTED")
 
         now = datetime.now(timezone.utc)
+
+        # An expired request cannot receive a new approval decision.
+        if access_request.expires_at is not None:
+            deadline = access_request.expires_at
+            if deadline.tzinfo is None:
+                deadline = deadline.replace(tzinfo=timezone.utc)
+            if deadline <= now:
+                raise InvalidTransitionError(
+                    access_request.status, "EXPIRED"
+                )
+
+        if approver.id == access_request.user_id:
+            raise SelfApprovalError(
+                "A requester cannot reject their own access request."
+            )
+
+        check_transition(access_request.status, "REJECTED")
+
         approval.status = "REJECTED"
         approval.approver_id = approver.id
         approval.comment = comment
@@ -372,10 +423,16 @@ class AccessDecisionService:
         await write_audit_log(
             db, actor=approver, action="APPROVAL_REJECTED",
             target_type=_target_type(access_request.asset_id),
-            target_id=str(access_request.asset_id or access_request.application_id),
-            request_id=access_request.id, source_ip=source_ip,
-            result="DENIED", severity="MEDIUM", metadata={"comment": comment},
+            target_id=str(
+                access_request.asset_id or access_request.application_id
+            ),
+            request_id=access_request.id,
+            source_ip=source_ip,
+            result="DENIED",
+            severity="MEDIUM",
+            metadata={"comment": comment},
         )
+
         await db.commit()
         await db.refresh(access_request)
         return access_request
