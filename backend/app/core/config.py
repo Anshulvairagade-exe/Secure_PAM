@@ -46,6 +46,11 @@ class Settings(BaseSettings):
     KEYCLOAK_ADMIN_USER: str = "admin"
     KEYCLOAK_ADMIN_PASSWORD: str = ""
 
+    # --- Keycloak MFA Event Synchronization ---
+    KEYCLOAK_MFA_SYNC_ENABLED: bool = False
+    KEYCLOAK_MFA_SYNC_INTERVAL_SECONDS: int = 60
+    KEYCLOAK_MFA_SYNC_LOOKBACK_HOURS: int = 1
+
     # --- Vault ---
     VAULT_URL: str = "http://vault:8200"
     VAULT_TOKEN: str = ""
