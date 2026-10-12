@@ -7,7 +7,7 @@ Secrets must never have default values in production.
 
 from typing import List
 from pydantic_settings import BaseSettings
-from pydantic import field_validator
+from pydantic import field_validator, model_validator
 
 
 class Settings(BaseSettings):
@@ -109,11 +109,26 @@ class Settings(BaseSettings):
     def KEYCLOAK_AUTH_URL(self) -> str:
         return f"{self.KEYCLOAK_ISSUER_URL}/protocol/openid-connect/auth"
 
-    @field_validator("SECRET_KEY")
-    @classmethod
-    def secret_key_must_be_changed(cls, v: str, info) -> str:
-        # In production, enforce a real secret key
-        return v
+    @model_validator(mode="after")
+    def validate_security_settings(self):
+        environment = self.ENVIRONMENT.strip().lower()
+
+        if environment in {"production", "staging"}:
+            if self.DEV_MODE:
+                raise ValueError(
+                    "DEV_MODE must be False in production and staging."
+                )
+
+            placeholder = (
+                "change-this-to-a-secure-random-string-in-production"
+            )
+            if not self.SECRET_KEY.strip() or self.SECRET_KEY == placeholder:
+                raise ValueError(
+                    "SECRET_KEY must be a non-empty, "
+                    "non-placeholder secret in production and staging."
+                )
+
+        return self
 
     model_config = {
         "env_file": ".env",
