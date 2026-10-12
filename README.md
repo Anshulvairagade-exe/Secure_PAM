@@ -503,6 +503,16 @@ The error text tells you which layer refused:
   exceptions without the HTTP cause chained in.
 - `backend/.dockerignore` keeps `backend/.env` out of built images.
 
+### Grant lifetime bounds session lifetime
+
+When a JIT grant is revoked or expires (`JITService.revoke`/`expire`, or the
+lazy flip inside `validate`), every live session bound to it is marked
+`EXPIRED`, its in-progress recording is finalized, and a
+`SESSION_ENDED_BY_GRANT` event is recorded. Expiry is still evaluated
+lazily (when something reads the grant) — a background sweep is future work,
+and the real gateway must tear down the connection when a session leaves a
+live state.
+
 ### Remaining production-hardening requirements
 
 The local `bao server -dev` instance is **not** production: it is
@@ -644,10 +654,10 @@ placeholder values (no real secrets). Key ones for local dev:
 
 | Variable | Purpose |
 |---|---|
-| `DEV_MODE` | `true` enables local JWT login + auto-seeding; `false` requires Keycloak (not implemented yet — see `app/auth/oidc_provider.py`) |
+| `DEV_MODE` | `true` enables local JWT login, the DevAuth validator and seeded known-password accounts; startup refuses it unless `ENVIRONMENT` is `development` or `test`. `false` uses Keycloak OIDC (`app/auth/oidc_provider.py`) |
 | `DATABASE_URL` | Must keep the `+asyncpg` driver suffix |
 | `REDIS_URL` | Used by `/health/ready` and (later) JIT TTL enforcement |
-| `SECRET_KEY` | Signs DevAuth JWTs — change in any non-local environment |
+| `SECRET_KEY` | Signs DevAuth JWTs. Startup refuses the placeholder (or anything under 32 characters) when `ENVIRONMENT=production` |
 | `LOG_LEVEL`, `DEBUG` | `DEBUG=true` also raises the `sqlalchemy.engine` logger to INFO |
 | `BACKEND_CORS_ORIGINS` | Must include whatever origin the frontend is actually served from |
 | `SECRET_PROVIDER`, `OPENBAO_*` | Credential provider — see [Credential management (OpenBao)](#credential-management-openbao) |
