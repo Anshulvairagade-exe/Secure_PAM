@@ -182,6 +182,7 @@ services:
       - ./infrastructure/openbao/policies:/openbao/policies:ro
       - ./infrastructure/openbao/init-lab.sh:/openbao/init-lab.sh:ro
       - openbao_runtime:/openbao/runtime
+    user: "0:0"
     entrypoint: ["/bin/sh", "/openbao/init-lab.sh"]
     depends_on:
       openbao:

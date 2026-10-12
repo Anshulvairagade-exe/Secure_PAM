@@ -38,6 +38,8 @@ bao kv put secret/targets/lab-sample \
   password="lab-only-not-a-real-credential" \
   >/dev/null
 
+mkdir -p /openbao/runtime
+chmod 700 /openbao/runtime
 umask 077
 bao token create \
   -policy=securepam-runtime \
