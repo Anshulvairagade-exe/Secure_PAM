@@ -1,7 +1,5 @@
 import pytest
-from pydantic import ValidationError
-
-from app.core.config import Settings
+from app.core.config import Settings, SettingsError
 
 
 def test_development_settings_allow_dev_mode():
@@ -14,7 +12,7 @@ def test_development_settings_allow_dev_mode():
 
 
 def test_production_rejects_dev_mode():
-    with pytest.raises(ValidationError):
+    with pytest.raises(SettingsError):
         Settings(
             ENVIRONMENT="production",
             DEV_MODE=True,
@@ -23,7 +21,7 @@ def test_production_rejects_dev_mode():
 
 
 def test_production_rejects_placeholder_secret():
-    with pytest.raises(ValidationError):
+    with pytest.raises(SettingsError):
         Settings(
             ENVIRONMENT="production",
             DEV_MODE=False,
@@ -37,7 +35,10 @@ def test_production_accepts_secure_configuration():
     settings = Settings(
         ENVIRONMENT="production",
         DEV_MODE=False,
-        SECRET_KEY="a-strong-test-secret-key",
+        SECRET_KEY="a-strong-test-secret-key-for-testing-only",
+        SECRET_PROVIDER="openbao",
+        OPENBAO_ADDR="https://openbao.example.test:8200",
+        OPENBAO_TOKEN="synthetic-test-token",
     )
 
     assert settings.DEV_MODE is False
@@ -49,7 +50,7 @@ def test_production_accepts_secure_configuration():
 def test_protected_environments_reject_blank_secret(
     environment, secret
 ):
-    with pytest.raises(ValidationError):
+    with pytest.raises(SettingsError):
         Settings(
             ENVIRONMENT=environment,
             DEV_MODE=False,
@@ -58,7 +59,7 @@ def test_protected_environments_reject_blank_secret(
 
 
 def test_staging_rejects_dev_mode():
-    with pytest.raises(ValidationError):
+    with pytest.raises(SettingsError):
         Settings(
             ENVIRONMENT="staging",
             DEV_MODE=True,

@@ -19,9 +19,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.core.deps import get_db
+from app.core.logging import get_logger
 from app.schemas.common import DetailedHealthCheck, HealthCheck, LivenessCheck, ReadinessCheck, ServiceHealth
 
 router = APIRouter(tags=["health"])
+logger = get_logger(__name__)
 
 
 @router.get("/health", response_model=HealthCheck)
@@ -80,7 +82,7 @@ async def detailed_health_check(db: AsyncSession = Depends(get_db)):
     services.append(idp_health)
 
     # Vault
-    vault_health = _check_vault()
+    vault_health = await _check_vault()
     services.append(vault_health)
 
     # Gateway
@@ -110,6 +112,14 @@ async def detailed_health_check(db: AsyncSession = Depends(get_db)):
     )
 
 
+def _log_unhealthy(service: str, exc: Exception) -> str:
+    """Health endpoints are unauthenticated: log the real error server-side
+    and return only a generic message (exception text can carry hostnames,
+    usernames or driver internals)."""
+    logger.warning("health_check_failed", service=service, error_type=type(exc).__name__, exc_info=True)
+    return f"{service} unreachable"
+
+
 async def _check_database(db: AsyncSession) -> ServiceHealth:
     """Check PostgreSQL connectivity."""
     try:
@@ -125,7 +135,7 @@ async def _check_database(db: AsyncSession) -> ServiceHealth:
         return ServiceHealth(
             service="database",
             status="unhealthy",
-            details=str(e),
+            details=_log_unhealthy("database", e),
         )
 
 
@@ -148,7 +158,7 @@ async def _check_redis() -> ServiceHealth:
         return ServiceHealth(
             service="redis",
             status="unhealthy",
-            details=str(e),
+            details=_log_unhealthy("redis", e),
         )
 
 
@@ -167,18 +177,23 @@ def _check_idp() -> ServiceHealth:
     )
 
 
-def _check_vault() -> ServiceHealth:
-    """Check Vault/OpenBao status."""
-    if settings.DEV_MODE or not settings.VAULT_ENABLED:
-        return ServiceHealth(
-            service="vault",
-            status="healthy",
-            details="DEV_MODE: MockVault active",
-        )
+async def _check_vault() -> ServiceHealth:
+    """
+    Check the configured secret provider. Reports reachability only: the
+    detail strings come from ProviderHealth, which never includes the token
+    or any secret value. The mock provider is healthy only in DEV_MODE —
+    anywhere else it is reported degraded rather than passed off as real.
+    """
+    from app.secret_providers import get_secret_provider
+
+    result = await get_secret_provider().health()
+    if result.provider == "mock" and result.healthy and not settings.DEV_MODE:
+        return ServiceHealth(service="vault", status="degraded", details="Mock secret provider active outside DEV_MODE")
     return ServiceHealth(
         service="vault",
-        status="degraded",
-        details="Vault not yet configured",
+        status="healthy" if result.healthy else "unhealthy",
+        latency_ms=result.latency_ms,
+        details=f"{result.provider}: {result.detail}",
     )
 
 

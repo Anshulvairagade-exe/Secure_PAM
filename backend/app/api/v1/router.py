@@ -12,6 +12,11 @@ from app.api.v1.applications import router as applications_router
 from app.api.v1.policies import router as policies_router
 from app.api.v1.access_requests import router as access_requests_router
 from app.api.v1.approvals import router as approvals_router
+from app.api.v1.credential_refs import router as credential_refs_router
+# M9 & M12 Routers
+from app.api.v1.sessions import router as sessions_router
+from app.api.v1.recordings import router as recordings_router
+from app.api.v1.audit import router as audit_router
 
 # Main v1 router
 api_router = APIRouter()
@@ -24,5 +29,8 @@ api_router.include_router(applications_router)
 api_router.include_router(policies_router)
 api_router.include_router(access_requests_router)
 api_router.include_router(approvals_router)
-
-# Health is mounted at root level, not under /api/v1
+api_router.include_router(credential_refs_router)
+# Registered M9 & M12 sub-routers
+api_router.include_router(sessions_router)
+api_router.include_router(recordings_router)
+api_router.include_router(audit_router)

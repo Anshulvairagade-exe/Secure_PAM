@@ -26,7 +26,8 @@ pytest tests/test_auth.py -v        # one file
 pytest -k "rbac"        # by keyword
 ```
 
-`tests/conftest.py` forces `DEV_MODE=true` and `ENVIRONMENT=test` regardless
+`tests/conftest.py` forces `DEV_MODE=true`, `ENVIRONMENT=test` and
+`SECRET_PROVIDER=mock` regardless
 of your shell env — tests always exercise DevAuth, and `ENVIRONMENT=test`
 switches the DB engine to `NullPool` (see `app/database/session.py`): under
 pytest, pooled asyncpg connections can get bound to an event loop that a
@@ -52,6 +53,12 @@ tests rather than fought with.
 | `test_access_requests.py` | XOR target validation, protocol-mismatch/disabled-target/excessive-duration 422s, privilege-escalation resistance, IDOR (404 not 403 for a peer's request), own-vs-view-all list scoping, cancel state machine, and the deterministic decision-matrix outcomes (see note below) |
 | `test_approvals.py` | Approve/reject, self-approval blocked (403), duplicate-decision blocked (409), mandatory rejection comment (422), RBAC on the approval queue, JIT duration clamped to the policy maximum on approval |
 | `test_jit_service.py` | `JITService` exercised directly (no REST endpoint exists for it — see its module docstring): grant/validate/revoke/expire, wrong-user/wrong-target/wrong-protocol denial, lazy-expiry |
+| `test_secret_settings.py` | `SECRET_PROVIDER`/`OPENBAO_*` defaults and fail-safe validation (missing token/addr, bad URL, traversal in mount/prefix, production refuses mock and plain http), and that no validation error or repr ever contains the token |
+| `test_secret_providers.py` | Path rules, read-only provider interface, mock provider reads/failures, OpenBao KV v2 parsing via `httpx.MockTransport` (versions, 401/403/404/429/5xx, timeouts, non-JSON, deleted/destroyed), token only in the header, health never sends the token, `Credential` redaction/wipe |
+| `test_credential_service.py` | Every authorization check before retrieval (user, RBAC, IDOR, request status/owner/target/approval, disabled/deleted asset, missing/revoked/expired/lapsed/mismatched JIT grant, protocol, session binding, missing/ambiguous/tampered/wrong-provider reference); provider never called on denial; provider outages fail closed; audit rows; no secret/token in audit, logs or exceptions |
+| `test_credential_refs.py` | Admin credential-ref endpoints: server-derived path, client can't pick path/provider or send a secret (422), RBAC for every non-admin role, and a sweep proving no HTTP response contains a retrieved secret |
+| `test_openbao_live.py` | **Opt-in** (`OPENBAO_LIVE_TEST=1`): real OpenBao with the restricted token — read allowed; write/patch/delete/destroy/metadata and admin endpoints 403. Refuses to run with a privileged token; probes never touch the real secret |
+| `test_session_endpoints.py` | Audit/session/recording endpoints: 401 without a token, RBAC per role, IDOR (a peer's session is 404 for detail and terminate), termination rules (owner or `sessions:terminate`, 409 when not live), RDP launch only through a live JIT grant + `CredentialService` (fails closed and marks the session FAILED; response never carries a credential or path; client can't supply identity), recording streaming confined to `RECORDING_STORAGE_PATH` (absolute, `..` and symlink escapes → 404) and audited |
 | `test_phase4_audit.py` | `ACCESS_REQUEST_CREATED`/`POLICY_EVALUATED`/`RISK_EVALUATED`/`APPROVAL_REQUESTED` or `ACCESS_ALLOWED`/`ACCESS_DENIED` on creation; `ACCESS_REQUEST_CANCELLED`; `APPROVAL_GRANTED`+`JIT_GRANTED`; `APPROVAL_REJECTED` |
 
 **Why some Phase 4 outcomes are tested via direct service calls, not
@@ -75,6 +82,17 @@ HTTP endpoints") is in `test_assets.py` / `test_applications.py` /
 `test_policies.py`. `PermissionChecker.__call__` now takes `request` and
 `db` (it writes an `ACCESS_DENIED` audit event on denial), so calling it
 directly here means passing both explicitly — see the top of the file.
+
+## Live OpenBao tests (opt-in)
+
+Ordinary runs never contact OpenBao. To verify a real server and the
+restricted token (never a root token — the module aborts if the token can
+read `sys/mounts`):
+
+```bash
+OPENBAO_LIVE_TEST=1 OPENBAO_LIVE_ADDR=http://127.0.0.1:8200 \
+OPENBAO_LIVE_TOKEN="$SECUREPAM_BAO_TOKEN" pytest tests/test_openbao_live.py -v
+```
 
 ## Fixtures (`tests/conftest.py`)
 

@@ -136,6 +136,24 @@ class RoleChecker:
             )
         return current_user
 
+def user_has_permission(user: User, resource: str, action: str) -> bool:
+    """ADMIN has all permissions only while the ADMIN role is active."""
+    active_roles = [
+        ur.role for ur in user.roles
+        if ur.role and ur.role.is_active
+    ]
+
+    if any(role.name == "ADMIN" for role in active_roles):
+        return True
+
+    required = f"{resource}:{action}"
+    return any(
+        f"{perm.resource}:{perm.action}" == required
+        for role in active_roles
+        for perm in role.permissions
+    )
+
+
 
 class PermissionChecker:
     """
@@ -145,11 +163,16 @@ class PermissionChecker:
 
     Usage:
         @router.post("/assets", dependencies=[Depends(PermissionChecker("assets", "create"))])
+
+    Extra actions are alternatives — any one of them suffices, e.g.
+    PermissionChecker("sessions", "read", "read_own"). Object-level scoping
+    (own vs. all) is then the route's job.
     """
 
-    def __init__(self, resource: str, action: str):
+    def __init__(self, resource: str, action: str, *alternatives: str):
         self.resource = resource
         self.action = action
+        self.actions = (action, *alternatives)
 
     async def __call__(
         self,
@@ -157,24 +180,11 @@ class PermissionChecker:
         current_user: User = Depends(get_current_active_user),
         db: AsyncSession = Depends(get_db),
     ) -> User:
-        user_permissions = set()
-        for ur in current_user.roles:
-            if ur.role and ur.role.is_active:
-                for perm in ur.role.permissions:
-                    user_permissions.add(f"{perm.resource}:{perm.action}")
 
-        required = f"{self.resource}:{self.action}"
+        required = " | ".join(f"{self.resource}:{a}" for a in self.actions)
 
-        # ADMIN has all permissions
-        user_roles = [
-            ur.role.name
-            for ur in current_user.roles
-            if ur.role and ur.role.is_active
-        ]
-        if "ADMIN" in user_roles:
-            return current_user
+        if not any(user_has_permission(current_user, self.resource, a) for a in self.actions):
 
-        if required not in user_permissions:
             await write_audit_log(
                 db,
                 actor=current_user,
