@@ -181,7 +181,24 @@ async def test_disabled_provider_refuses_retrieval():
 def test_factory_stays_disabled_without_a_configured_token(monkeypatch):
     monkeypatch.setattr("app.secrets.openbao.settings.VAULT_ENABLED", True)
     monkeypatch.setattr("app.secrets.openbao.settings.VAULT_TOKEN", "")
+    monkeypatch.setattr("app.secrets.openbao.settings.VAULT_TOKEN_FILE", "")
     assert isinstance(get_secret_provider(), DisabledSecretProvider)
+
+
+def test_factory_reads_runtime_token_file_without_logging_it(monkeypatch, tmp_path):
+    token_file = tmp_path / "app-token"
+    token_file.write_text("file-runtime-token\n", encoding="utf-8")
+    logger = ListLogger()
+    monkeypatch.setattr("app.secrets.openbao.settings.VAULT_ENABLED", False)
+    monkeypatch.setattr("app.secrets.openbao.settings.VAULT_TOKEN", "")
+    monkeypatch.setattr("app.secrets.openbao.settings.VAULT_TOKEN_FILE", str(token_file))
+    monkeypatch.setattr("app.secrets.openbao.get_logger", lambda name="securepam": logger)
+
+    provider = get_secret_provider()
+
+    assert isinstance(provider, OpenBaoSecretProvider)
+    assert provider._token == "file-runtime-token"
+    assert "file-runtime-token" not in json.dumps(logger.records)
 
 
 def test_secret_material_repr_lists_field_names_only():

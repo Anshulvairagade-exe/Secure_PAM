@@ -51,6 +51,8 @@ class Settings(BaseSettings):
     # is intentionally not a Settings field.
     VAULT_URL: str = "http://vault:8200"
     VAULT_TOKEN: str = ""
+    # Lab Compose mounts the non-root token here. The value stays out of Git.
+    VAULT_TOKEN_FILE: str = ""
     VAULT_MOUNT_PATH: str = "secret"
     VAULT_ENABLED: bool = False
 

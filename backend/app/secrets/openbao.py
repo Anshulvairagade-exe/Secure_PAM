@@ -8,6 +8,7 @@ the dev root token.
 """
 
 import re
+from pathlib import Path
 from typing import Optional
 
 import httpx
@@ -147,12 +148,37 @@ def _material_from_kv2(response: httpx.Response) -> SecretMaterial:
     )
 
 
+def runtime_vault_token() -> str:
+    """Return the least-privilege token. Never log the result."""
+    configured = settings.VAULT_TOKEN.strip()
+    if configured:
+        return configured
+    path = settings.VAULT_TOKEN_FILE.strip()
+    if not path:
+        return ""
+    try:
+        file = Path(path)
+        if not file.is_file():
+            return ""
+        return file.read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+
+
+def openbao_retrieval_enabled() -> bool:
+    """True when a runtime token is available from the env or the lab token file."""
+    if not runtime_vault_token():
+        return False
+    return settings.VAULT_ENABLED or bool(settings.VAULT_TOKEN_FILE.strip())
+
+
 def get_secret_provider() -> SecretProvider:
     """Application provider. Disabled until a non-empty runtime token is configured."""
-    if not settings.VAULT_ENABLED or not settings.VAULT_TOKEN:
+    token = runtime_vault_token()
+    if not openbao_retrieval_enabled():
         return DisabledSecretProvider()
     return OpenBaoSecretProvider(
         base_url=settings.VAULT_URL,
-        token=settings.VAULT_TOKEN,
+        token=token,
         mount=settings.VAULT_MOUNT_PATH,
     )

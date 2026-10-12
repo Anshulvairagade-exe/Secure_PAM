@@ -21,6 +21,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import settings
 from app.core.deps import get_db
 from app.schemas.common import DetailedHealthCheck, HealthCheck, LivenessCheck, ReadinessCheck, ServiceHealth
+from app.secrets.openbao import runtime_vault_token
 
 router = APIRouter(tags=["health"])
 
@@ -173,7 +174,7 @@ _OPENBAO_UP = {200, 429, 473}
 
 def _check_vault(client: Optional[httpx.Client] = None) -> ServiceHealth:
     """Check OpenBao. Disabled mode does not call the network."""
-    if not settings.VAULT_ENABLED:
+    if not settings.VAULT_ENABLED and not runtime_vault_token():
         if settings.DEV_MODE:
             return ServiceHealth(
                 service="vault",

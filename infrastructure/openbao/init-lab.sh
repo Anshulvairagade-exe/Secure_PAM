@@ -39,7 +39,7 @@ bao kv put secret/targets/lab-sample \
   >/dev/null
 
 mkdir -p /openbao/runtime
-chmod 700 /openbao/runtime
+chmod 711 /openbao/runtime
 umask 077
 bao token create \
   -policy=securepam-runtime \
@@ -49,5 +49,8 @@ bao token create \
   -display-name=securepam-lab \
   -field=token \
   > /openbao/runtime/app-token
+# Lab volume only. The directory is traversable and the file is world-readable
+# so the non-root backend user can load the token. The volume is not a host directory.
+chmod 444 /openbao/runtime/app-token
 
 echo "OpenBao lab configuration applied. Runtime token stored in the openbao_runtime volume."
