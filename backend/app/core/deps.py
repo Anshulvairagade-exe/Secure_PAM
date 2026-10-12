@@ -123,7 +123,11 @@ class RoleChecker:
         self,
         current_user: User = Depends(get_current_active_user),
     ) -> User:
-        user_roles = [ur.role.name for ur in current_user.roles if ur.role]
+        user_roles = [
+            ur.role.name
+            for ur in current_user.roles
+            if ur.role and ur.role.is_active
+        ]
         
         if not any(role in user_roles for role in self.required_roles):
             raise HTTPException(
@@ -155,14 +159,18 @@ class PermissionChecker:
     ) -> User:
         user_permissions = set()
         for ur in current_user.roles:
-            if ur.role:
+            if ur.role and ur.role.is_active:
                 for perm in ur.role.permissions:
                     user_permissions.add(f"{perm.resource}:{perm.action}")
 
         required = f"{self.resource}:{self.action}"
 
         # ADMIN has all permissions
-        user_roles = [ur.role.name for ur in current_user.roles if ur.role]
+        user_roles = [
+            ur.role.name
+            for ur in current_user.roles
+            if ur.role and ur.role.is_active
+        ]
         if "ADMIN" in user_roles:
             return current_user
 
