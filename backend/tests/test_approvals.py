@@ -10,7 +10,9 @@ in APPROVAL_REQUIRED regardless of real-world business-hours/risk wobble
 """
 
 from uuid import uuid4
+from datetime import datetime, timedelta, timezone
 
+from app.models.access_request import AccessRequest
 from httpx import AsyncClient
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -200,3 +202,59 @@ async def test_operator_cannot_view_approval_queue(client: AsyncClient, operator
 async def test_auditor_can_view_approval_queue(client: AsyncClient, auditor_token: str):
     resp = await client.get("/api/v1/approvals", headers=auth_header(auditor_token))
     assert resp.status_code == 200
+
+
+async def test_expired_request_cannot_be_approved(
+    client: AsyncClient,
+    admin_token: str,
+    operator_token: str,
+    approver_token: str,
+    db_session: AsyncSession,
+):
+    request_id, approval_id = await _create_approval_required_request(
+        client, admin_token, operator_token, db_session
+    )
+
+    request = await db_session.get(AccessRequest, request_id)
+    assert request is not None
+    request.expires_at = datetime.now(timezone.utc) - timedelta(minutes=1)
+    await db_session.commit()
+
+    response = await client.post(
+        f"/api/v1/approvals/{approval_id}/approve",
+        json={},
+        headers=auth_header(approver_token),
+    )
+
+    assert response.status_code == 409
+
+    await db_session.refresh(request)
+    assert request.status == "APPROVAL_REQUIRED"
+
+
+async def test_expired_request_cannot_be_rejected(
+    client: AsyncClient,
+    admin_token: str,
+    operator_token: str,
+    approver_token: str,
+    db_session: AsyncSession,
+):
+    request_id, approval_id = await _create_approval_required_request(
+        client, admin_token, operator_token, db_session
+    )
+
+    request = await db_session.get(AccessRequest, request_id)
+    assert request is not None
+    request.expires_at = datetime.now(timezone.utc) - timedelta(minutes=1)
+    await db_session.commit()
+
+    response = await client.post(
+        f"/api/v1/approvals/{approval_id}/reject",
+        json={"comment": "Testing expired request"},
+        headers=auth_header(approver_token),
+    )
+
+    assert response.status_code == 409
+
+    await db_session.refresh(request)
+    assert request.status == "APPROVAL_REQUIRED"

@@ -1,7 +1,8 @@
 """
 FastAPI dependencies — database sessions, auth, and service providers.
 """
-
+from app.auth.oidc_provider import OIDCProviderUnavailableError
+from app.core.config import settings
 from typing import AsyncGenerator, List, Optional
 
 from fastapi import Depends, HTTPException, Request, status
@@ -56,6 +57,11 @@ async def get_current_user(
     validator = get_token_validator()
     try:
         identity = validator.validate(credentials.credentials)
+    except OIDCProviderUnavailableError:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Identity provider temporarily unavailable",
+        )
     except InvalidTokenError:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -67,16 +73,18 @@ async def get_current_user(
             detail=str(e),
         )
 
-    # Resolve the token's identity to a local user. In DEV_MODE `subject` is
-    # the username; under OIDC it will be Keycloak's `sub`, matched against
-    # User.external_id instead — that lookup is added alongside OIDC support.
+    # Resolve the authenticated identity to a local SecurePAM user.
+    # Dev tokens use the username; Keycloak tokens use the external subject ID.
+    identity_column = User.username if settings.DEV_MODE else User.external_id
+
     result = await db.execute(
         select(User).where(
-            User.username == identity.subject,
+            identity_column == identity.subject,
             User.is_active == True,
             User.is_deleted == False,
         )
     )
+
     user = result.scalar_one_or_none()
 
     if not user:

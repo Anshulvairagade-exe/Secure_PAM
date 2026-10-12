@@ -7,9 +7,9 @@ directly, since there is no dedicated JIT REST endpoint (by design — see
 JITService's module docstring: it's a service for future gateway code,
 not an API surface Phase 4 was asked to add).
 """
+import pytest
 
 from datetime import datetime, timedelta, timezone
-
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -172,3 +172,106 @@ async def test_is_active_reflects_status_and_expiry_without_db_access(db_session
 
     grant.status = "REVOKED"
     assert service.is_active(grant) is False
+
+
+@pytest.mark.parametrize("duration_minutes", [0, -1])
+async def test_grant_rejects_non_positive_duration(
+    db_session: AsyncSession,
+    duration_minutes: int,
+):
+    operator = await _get(db_session, User, username="operator")
+    asset = await _get(db_session, Asset, name="LINUX-DEV-01")
+    req = await _make_request(
+        db_session, user_id=operator.id, asset_id=asset.id
+    )
+
+    with pytest.raises(ValueError, match="greater than zero"):
+        await service.grant(
+            db_session,
+            request_id=req.id,
+            user_id=operator.id,
+            asset_id=asset.id,
+            application_id=None,
+            protocol="SSH",
+            duration_minutes=duration_minutes,
+            created_by=None,
+        )
+
+
+async def test_grant_duration_never_exceeds_request_duration(
+    db_session: AsyncSession,
+):
+    operator = await _get(db_session, User, username="operator")
+    asset = await _get(db_session, Asset, name="LINUX-DEV-01")
+    req = await _make_request(
+        db_session, user_id=operator.id, asset_id=asset.id
+    )
+
+    # The request asks for 30 minutes, but the caller supplies 60.
+    grant = await service.grant(
+        db_session,
+        request_id=req.id,
+        user_id=operator.id,
+        asset_id=asset.id,
+        application_id=None,
+        protocol="SSH",
+        duration_minutes=60,
+        created_by=None,
+    )
+
+    actual_minutes = (
+        grant.expires_at - grant.granted_at
+    ).total_seconds() / 60
+    assert abs(actual_minutes - 30) < 1
+
+
+async def test_grant_duration_respects_policy_maximum(
+    db_session: AsyncSession,
+):
+    operator = await _get(db_session, User, username="operator")
+    asset = await _get(db_session, Asset, name="LINUX-DEV-01")
+    req = await _make_request(
+        db_session, user_id=operator.id, asset_id=asset.id
+    )
+    req.policy_decision = {"max_duration": 10}
+    await db_session.flush()
+
+    grant = await service.grant(
+        db_session,
+        request_id=req.id,
+        user_id=operator.id,
+        asset_id=asset.id,
+        application_id=None,
+        protocol="SSH",
+        duration_minutes=30,
+        created_by=None,
+    )
+
+    actual_minutes = (
+        grant.expires_at - grant.granted_at
+    ).total_seconds() / 60
+    assert abs(actual_minutes - 10) < 1
+
+
+async def test_grant_rejects_target_mismatch(
+    db_session: AsyncSession,
+):
+    operator = await _get(db_session, User, username="operator")
+    asset = await _get(db_session, Asset, name="LINUX-DEV-01")
+    other_asset = await _get(db_session, Asset, name="WIN-PROD-01")
+
+    req = await _make_request(
+        db_session, user_id=operator.id, asset_id=asset.id
+    )
+
+    with pytest.raises(ValueError, match="match the originating access request"):
+        await service.grant(
+            db_session,
+            request_id=req.id,
+            user_id=operator.id,
+            asset_id=other_asset.id,
+            application_id=None,
+            protocol="SSH",
+            duration_minutes=15,
+            created_by=None,
+        )
