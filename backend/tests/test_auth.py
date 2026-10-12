@@ -164,3 +164,35 @@ async def test_keycloak_identity_uses_external_id(
     assert resp.json()["username"] == "operator"
     # The token's ADMIN claim must not grant local ADMIN privileges.
     assert "ADMIN" not in resp.json()["roles"]
+
+
+async def test_me_excludes_inactive_role_and_permissions(
+    client: AsyncClient,
+    admin_token: str,
+    db_session,
+):
+    from sqlalchemy import select
+    from app.models.role import Role
+
+    role = await db_session.scalar(
+        select(Role).where(Role.name == "ADMIN")
+    )
+    assert role is not None
+
+    original_active = role.is_active
+    try:
+        role.is_active = False
+        await db_session.commit()
+
+        resp = await client.get(
+            "/api/v1/auth/me",
+            headers=auth_header(admin_token),
+        )
+
+        assert resp.status_code == 200
+        body = resp.json()
+        assert "ADMIN" not in body["roles"]
+        assert "users:delete" not in body["permissions"]
+    finally:
+        role.is_active = original_active
+        await db_session.commit()
