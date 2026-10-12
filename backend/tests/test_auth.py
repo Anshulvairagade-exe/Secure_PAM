@@ -196,3 +196,127 @@ async def test_me_excludes_inactive_role_and_permissions(
     finally:
         role.is_active = original_active
         await db_session.commit()
+
+async def test_keycloak_identity_rejects_inactive_user(
+    client: AsyncClient,
+    db_session,
+    monkeypatch,
+):
+    from app.auth import TokenIdentity
+    from app.auth.oidc_provider import OIDCTokenValidator
+
+    monkeypatch.setattr("app.core.deps.settings.DEV_MODE", False)
+    monkeypatch.setattr(
+        "app.core.deps.get_token_validator",
+        lambda: OIDCTokenValidator(),
+    )
+
+    user = await db_session.scalar(
+        select(User).where(User.username == "operator")
+    )
+    assert user is not None
+
+    user.external_id = "inactive-keycloak-sub"
+    user.is_active = False
+    await db_session.commit()
+
+    with patch.object(
+        OIDCTokenValidator,
+        "validate",
+        return_value=TokenIdentity(
+            subject="inactive-keycloak-sub",
+            email=user.email,
+            name=user.full_name,
+            token_roles=[],
+        ),
+    ):
+        response = await client.get(
+            "/api/v1/auth/me",
+            headers=auth_header("inactive-keycloak-token"),
+        )
+
+    assert response.status_code == 401
+    assert response.json()["detail"] == "User not found or inactive"
+
+
+async def test_keycloak_identity_rejects_deleted_user(
+    client: AsyncClient,
+    db_session,
+    monkeypatch,
+):
+    from app.auth import TokenIdentity
+    from app.auth.oidc_provider import OIDCTokenValidator
+
+    monkeypatch.setattr("app.core.deps.settings.DEV_MODE", False)
+    monkeypatch.setattr(
+        "app.core.deps.get_token_validator",
+        lambda: OIDCTokenValidator(),
+    )
+
+    user = await db_session.scalar(
+        select(User).where(User.username == "operator")
+    )
+    assert user is not None
+
+    user.external_id = "deleted-keycloak-sub"
+    user.is_deleted = True
+    await db_session.commit()
+
+    with patch.object(
+        OIDCTokenValidator,
+        "validate",
+        return_value=TokenIdentity(
+            subject="deleted-keycloak-sub",
+            email=user.email,
+            name=user.full_name,
+            token_roles=[],
+        ),
+    ):
+        response = await client.get(
+            "/api/v1/auth/me",
+            headers=auth_header("deleted-keycloak-token"),
+        )
+
+    assert response.status_code == 401
+    assert response.json()["detail"] == "User not found or inactive"
+
+
+async def test_unknown_keycloak_subject_is_not_auto_provisioned(
+    client: AsyncClient,
+    db_session,
+    monkeypatch,
+):
+    from app.auth import TokenIdentity
+    from app.models.user import User
+    from app.auth.oidc_provider import OIDCTokenValidator
+
+    monkeypatch.setattr("app.core.deps.settings.DEV_MODE", False)
+    monkeypatch.setattr(
+        "app.core.deps.get_token_validator",
+        lambda: OIDCTokenValidator(),
+    )
+
+    with patch.object(
+        OIDCTokenValidator,
+        "validate",
+        return_value=TokenIdentity(
+            subject="unknown-keycloak-subject",
+            email="unknown@example.test",
+            name="Unknown User",
+            token_roles=["ADMIN"],
+        ),
+    ):
+        response = await client.get(
+            "/api/v1/auth/me",
+            headers=auth_header("unknown-keycloak-token"),
+        )
+
+    assert response.status_code == 401
+    assert response.json()["detail"] == "User not found or inactive"
+
+    user = await db_session.scalar(
+        select(User).where(
+            User.external_id == "unknown-keycloak-subject"
+        )
+    )
+    assert user is None
