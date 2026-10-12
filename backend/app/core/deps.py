@@ -1,7 +1,8 @@
 """
 FastAPI dependencies — database sessions, auth, and service providers.
 """
-
+from app.auth.oidc_provider import OIDCProviderUnavailableError
+from app.core.config import settings
 from typing import AsyncGenerator, List, Optional
 
 from fastapi import Depends, HTTPException, Request, status
@@ -56,6 +57,11 @@ async def get_current_user(
     validator = get_token_validator()
     try:
         identity = validator.validate(credentials.credentials)
+    except OIDCProviderUnavailableError:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Identity provider temporarily unavailable",
+        )
     except InvalidTokenError:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -67,16 +73,18 @@ async def get_current_user(
             detail=str(e),
         )
 
-    # Resolve the token's identity to a local user. In DEV_MODE `subject` is
-    # the username; under OIDC it will be Keycloak's `sub`, matched against
-    # User.external_id instead — that lookup is added alongside OIDC support.
+    # Resolve the authenticated identity to a local SecurePAM user.
+    # Dev tokens use the username; Keycloak tokens use the external subject ID.
+    identity_column = User.username if settings.DEV_MODE else User.external_id
+
     result = await db.execute(
         select(User).where(
-            User.username == identity.subject,
+            identity_column == identity.subject,
             User.is_active == True,
             User.is_deleted == False,
         )
     )
+
     user = result.scalar_one_or_none()
 
     if not user:
@@ -125,6 +133,20 @@ class RoleChecker:
         return current_user
 
 
+def user_has_permission(user: User, resource: str, action: str) -> bool:
+    """The RBAC rule PermissionChecker enforces, usable outside a FastAPI
+    dependency (e.g. by CredentialService). ADMIN has all permissions."""
+    if any(ur.role and ur.role.name == "ADMIN" for ur in user.roles):
+        return True
+    required = f"{resource}:{action}"
+    return any(
+        f"{perm.resource}:{perm.action}" == required
+        for ur in user.roles
+        if ur.role
+        for perm in ur.role.permissions
+    )
+
+
 class PermissionChecker:
     """
     Dependency that checks if the current user has the required permission(s).
@@ -133,11 +155,16 @@ class PermissionChecker:
 
     Usage:
         @router.post("/assets", dependencies=[Depends(PermissionChecker("assets", "create"))])
+
+    Extra actions are alternatives — any one of them suffices, e.g.
+    PermissionChecker("sessions", "read", "read_own"). Object-level scoping
+    (own vs. all) is then the route's job.
     """
 
-    def __init__(self, resource: str, action: str):
+    def __init__(self, resource: str, action: str, *alternatives: str):
         self.resource = resource
         self.action = action
+        self.actions = (action, *alternatives)
 
     async def __call__(
         self,
@@ -145,20 +172,9 @@ class PermissionChecker:
         current_user: User = Depends(get_current_active_user),
         db: AsyncSession = Depends(get_db),
     ) -> User:
-        user_permissions = set()
-        for ur in current_user.roles:
-            if ur.role:
-                for perm in ur.role.permissions:
-                    user_permissions.add(f"{perm.resource}:{perm.action}")
+        required = " | ".join(f"{self.resource}:{a}" for a in self.actions)
 
-        required = f"{self.resource}:{self.action}"
-
-        # ADMIN has all permissions
-        user_roles = [ur.role.name for ur in current_user.roles if ur.role]
-        if "ADMIN" in user_roles:
-            return current_user
-
-        if required not in user_permissions:
+        if not any(user_has_permission(current_user, self.resource, a) for a in self.actions):
             await write_audit_log(
                 db,
                 actor=current_user,

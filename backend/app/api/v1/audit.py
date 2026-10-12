@@ -1,5 +1,10 @@
 """
 Audit API Router — M12 Structured Audit Logs & SIEM Export.
+
+Read-only, and only for holders of audit:read (AUDITOR, ADMIN). Audit
+rows describe every user's activity, so there is no "own rows" scope —
+a user without audit:read gets 403 (and that denial is itself audited by
+PermissionChecker).
 """
 
 import uuid
@@ -8,15 +13,18 @@ from typing import List, Optional
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
-from app.database.session import get_db
+from app.core.deps import PermissionChecker, get_db
 from app.models.audit import AuditLog
+from app.models.user import User
 
 router = APIRouter(prefix="/audit", tags=["Audit"])
 
 
 class AuditLogResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
     id: uuid.UUID
     event_id: str
     timestamp: datetime
@@ -28,16 +36,14 @@ class AuditLogResponse(BaseModel):
     severity: str
     details: Optional[dict]
 
-    class Config:
-        from_attributes = True
-
 
 @router.get("/", response_model=List[AuditLogResponse])
 async def get_audit_logs(
-    action: Optional[str] = Query(None),
-    severity: Optional[str] = Query(None),
-    limit: int = Query(50, le=200),
-    db: AsyncSession = Depends(get_db)
+    action: Optional[str] = Query(None, max_length=50),
+    severity: Optional[str] = Query(None, max_length=10),
+    limit: int = Query(50, ge=1, le=200),
+    db: AsyncSession = Depends(get_db),
+    _: User = Depends(PermissionChecker("audit", "read")),
 ):
     """Retrieve recent structured audit logs with optional filtering."""
     query = select(AuditLog).order_by(AuditLog.timestamp.desc()).limit(limit)

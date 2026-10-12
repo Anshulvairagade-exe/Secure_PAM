@@ -2,7 +2,10 @@
 Authentication: dev login, /me, invalid credentials, unauthorized access,
 and the core trust boundary between IdP identity and local RBAC.
 """
-
+from unittest.mock import patch
+from sqlalchemy import select
+from app.auth.oidc_provider import OIDCProviderUnavailableError
+from app.models.user import User
 from httpx import AsyncClient
 
 from tests.conftest import auth_header, issue_token
@@ -92,3 +95,72 @@ async def test_login_disabled_outside_dev_mode(client: AsyncClient, monkeypatch)
         "/api/v1/auth/login", json={"username": "operator", "password": "operator123"}
     )
     assert resp.status_code == 403
+
+
+
+async def test_keycloak_outage_returns_503(client: AsyncClient, monkeypatch):
+    """A Keycloak signing-key outage should return 503, not 401."""
+    from app.auth import get_token_validator
+    from app.auth.oidc_provider import OIDCTokenValidator
+
+    monkeypatch.setattr(
+        "app.core.deps.get_token_validator",
+        lambda: OIDCTokenValidator(),
+    )
+
+    with patch.object(
+        OIDCTokenValidator,
+        "validate",
+        side_effect=OIDCProviderUnavailableError("Keycloak unavailable"),
+    ):
+        resp = await client.get(
+            "/api/v1/auth/me",
+            headers=auth_header("any-token"),
+        )
+
+    assert resp.status_code == 503
+    assert resp.json()["detail"] == "Identity provider temporarily unavailable"
+
+
+async def test_keycloak_identity_uses_external_id(
+    client: AsyncClient,
+    db_session,
+    monkeypatch,
+):
+    """Keycloak's sub claim should match User.external_id, not username."""
+    from app.auth import TokenIdentity
+    from app.auth.oidc_provider import OIDCTokenValidator
+
+    # Ensure the dependency uses the Keycloak identity lookup path.
+    monkeypatch.setattr("app.core.deps.settings.DEV_MODE", False)
+    monkeypatch.setattr(
+        "app.core.deps.get_token_validator",
+        lambda: OIDCTokenValidator(),
+    )
+
+    user = await db_session.scalar(
+        select(User).where(User.username == "operator")
+    )
+    assert user is not None
+    user.external_id = "keycloak-sub-123"
+    await db_session.commit()
+
+    with patch.object(
+        OIDCTokenValidator,
+        "validate",
+        return_value=TokenIdentity(
+            subject="keycloak-sub-123",
+            email=user.email,
+            name=user.full_name,
+            token_roles=["ADMIN"],
+        ),
+    ):
+        resp = await client.get(
+            "/api/v1/auth/me",
+            headers=auth_header("mock-keycloak-token"),
+        )
+
+    assert resp.status_code == 200
+    assert resp.json()["username"] == "operator"
+    # The token's ADMIN claim must not grant local ADMIN privileges.
+    assert "ADMIN" not in resp.json()["roles"]

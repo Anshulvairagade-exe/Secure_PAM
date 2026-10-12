@@ -13,6 +13,23 @@ services:
   # ---------------------------------------------------------------------------
   # Core Services (always started)
   # ---------------------------------------------------------------------------
+  keycloak-postgres:
+    image: postgres:16-alpine
+    container_name: securepam-keycloak-postgres
+    profiles: ["lab"]
+    environment:
+      POSTGRES_DB: keycloak
+      POSTGRES_USER: keycloak
+      POSTGRES_PASSWORD: ${KEYCLOAK_DB_PASSWORD:?Set KEYCLOAK_DB_PASSWORD in .env}
+    volumes:
+      - keycloak_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U keycloak -d keycloak"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - securepam-net
 
   postgres:
     image: postgres:16-alpine
@@ -58,14 +75,23 @@ services:
     environment:
       - DATABASE_URL=postgresql+asyncpg://${POSTGRES_USER:-securepam}:${POSTGRES_PASSWORD:-securepam_dev_password}@postgres:5432/${POSTGRES_DB:-securepam}
       - REDIS_URL=redis://redis:6379/0
-      - VAULT_URL=http://openbao:8200
-      - VAULT_TOKEN_FILE=/run/openbao/app-token
+      - OPENBAO_ADDR=http://openbao:8200
     ports:
       - "${BACKEND_PORT:-8000}:8000"
     volumes:
       - ./backend:/app
       - recording_data:/data/recordings
       - openbao_runtime:/run/openbao:ro
+    command:
+      - sh
+      - -c
+      - |
+        if [ -s /run/openbao/app-token ]; then
+          export OPENBAO_TOKEN="$$(cat /run/openbao/app-token)"
+          export SECRET_PROVIDER=openbao
+          export OPENBAO_ADDR=http://openbao:8200
+        fi
+        alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
     depends_on:
       postgres:
         condition: service_healthy
@@ -106,19 +132,25 @@ services:
     image: quay.io/keycloak/keycloak:24.0
     container_name: securepam-keycloak
     profiles: ["lab"]
+
     environment:
       KEYCLOAK_ADMIN: ${KEYCLOAK_ADMIN_USER:-admin}
-      KEYCLOAK_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:-admin}
+      KEYCLOAK_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:?Set KEYCLOAK_ADMIN_PASSWORD in .env}
       KC_DB: postgres
-      KC_DB_URL: jdbc:postgresql://postgres:5432/${POSTGRES_DB:-securepam}
-      KC_DB_USERNAME: ${POSTGRES_USER:-securepam}
-      KC_DB_PASSWORD: ${POSTGRES_PASSWORD:-securepam_dev_password}
+      KC_DB_URL: jdbc:postgresql://keycloak-postgres:5432/keycloak
+      KC_DB_USERNAME: keycloak
+      KC_DB_PASSWORD: ${KEYCLOAK_DB_PASSWORD:?Set KEYCLOAK_DB_PASSWORD in .env}
+      KC_HOSTNAME: localhost
+      KC_HOSTNAME_PORT: "8080"
+      KC_HTTP_ENABLED: "true"
+      KC_HOSTNAME_STRICT: "false"
     command: start-dev
     ports:
-      - "8080:8080"
+      - "127.0.0.1:8080:8080"
     depends_on:
-      postgres:
+      keycloak-postgres:
         condition: service_healthy
+
     networks:
       - securepam-net
 
@@ -232,6 +264,7 @@ volumes:
   prometheus_data:
   grafana_data:
   openbao_runtime:
+  keycloak_postgres_data:
 
 networks:
   securepam-net:

@@ -5,7 +5,7 @@ All statistics are computed server-side.
 No hard-coded numbers.
 """
 
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends
 from sqlalchemy import and_, func, select
@@ -14,6 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.deps import get_current_active_user, get_db
 from app.models.access_request import AccessRequest
 from app.models.asset import Asset
+from app.models.recording import Recording
 from app.models.audit import AuditLog
 from app.models.jit_grant import JITGrant
 from app.models.session import Session
@@ -39,10 +40,10 @@ async def get_dashboard_summary(
         )
     ) or 0
 
-    # Pending requests
+    # Requests awaiting human approval
     pending_requests = await db.scalar(
         select(func.count()).select_from(AccessRequest).where(
-            AccessRequest.status == "PENDING"
+            AccessRequest.status == "APPROVAL_REQUIRED"
         )
     ) or 0
 
@@ -90,6 +91,16 @@ async def get_dashboard_summary(
         )
     ) or 0
 
+    # Recording storage (exclude deleted recordings)
+    recording_bytes = await db.scalar(
+        select(func.coalesce(func.sum(Recording.file_size), 0)).where(
+            Recording.status != "DELETED",
+            Recording.file_size.is_not(None),
+        )
+    ) or 0
+
+    recording_storage_mb = recording_bytes / (1024 * 1024)
+
     return DashboardSummary(
         active_sessions=active_sessions,
         pending_requests=pending_requests,
@@ -98,7 +109,7 @@ async def get_dashboard_summary(
         failed_mfa_attempts=failed_mfa,
         jit_grants_active=jit_active,
         registered_assets=registered_assets,
-        recording_storage_mb=0.0,  # TODO: Calculate from recordings table
+        recording_storage_mb=recording_storage_mb,
     )
 
 

@@ -30,23 +30,24 @@ else
   bao secrets enable -path=secret kv-v2
 fi
 
-bao policy write securepam-runtime /openbao/policies/securepam-runtime.hcl
+bao policy write securepam-read /openbao/policies/securepam-read.hcl
 
-# Synthetic path so the convention exists. This is not a real credential.
-bao kv put secret/targets/lab-sample \
-  username="lab-operator" \
-  password="lab-only-not-a-real-credential" \
+# Synthetic path matching CredentialService's server-derived convention.
+# This is not a real credential.
+bao kv put secret/securepam/assets/test-linux-01 \
+  username="fakeuser" \
+  password="fake-only" \
   >/dev/null
 
 mkdir -p /openbao/runtime
 chmod 711 /openbao/runtime
 umask 077
 bao token create \
-  -policy=securepam-runtime \
+  -policy=securepam-read \
   -no-default-policy \
   -orphan \
-  -ttl=768h \
-  -display-name=securepam-lab \
+  -ttl=24h \
+  -display-name=securepam-backend \
   -field=token \
   > /openbao/runtime/app-token
 # Lab volume only. The directory is traversable and the file is world-readable

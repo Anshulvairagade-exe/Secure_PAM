@@ -8,9 +8,10 @@ This is the main application factory that:
 4. Runs database initialization and seeding on startup
 """
 
+import asyncio
 import time
 import uuid
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 
 import structlog
 from fastapi import FastAPI, HTTPException, Request, Response, status
@@ -22,11 +23,34 @@ from app.api.v1.health import router as health_router
 from app.api.v1.router import api_router
 from app.core.config import settings
 from app.core.logging import configure_logging, get_logger
-from app.database.session import close_db, engine
+from app.database.session import async_session_factory, close_db, engine
+from app.services.keycloak_mfa_sync import sync_keycloak_mfa_failures
 
 configure_logging()
 logger = get_logger(__name__)
 
+async def _keycloak_mfa_sync_loop() -> None:
+    """Periodically import failed MFA events from Keycloak."""
+    interval = max(10, settings.KEYCLOAK_MFA_SYNC_INTERVAL_SECONDS)
+
+    while True:
+        try:
+            async with async_session_factory() as db:
+                imported = await sync_keycloak_mfa_failures(
+                    db,
+                    lookback_hours=settings.KEYCLOAK_MFA_SYNC_LOOKBACK_HOURS,
+                )
+
+            logger.info(
+                "keycloak_mfa_sync_completed",
+                imported_count=imported,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("keycloak_mfa_sync_failed")
+
+        await asyncio.sleep(interval)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -49,11 +73,27 @@ async def lifespan(app: FastAPI):
         # Seed default data
         await _seed_default_data()
 
-    yield
+    mfa_sync_task = None
 
-    # Shutdown
-    await close_db()
-    logger.info("app_shutdown", app=settings.APP_NAME)
+    if (
+        settings.KEYCLOAK_MFA_SYNC_ENABLED
+        and settings.ENVIRONMENT != "test"
+    ):
+        mfa_sync_task = asyncio.create_task(_keycloak_mfa_sync_loop())
+        logger.info("keycloak_mfa_sync_started")
+
+    try:
+        yield
+    finally:
+        if mfa_sync_task is not None:
+            mfa_sync_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await mfa_sync_task
+
+        # Shutdown
+        await close_db()
+        logger.info("app_shutdown", app=settings.APP_NAME)
+
 
 
 app = FastAPI(
@@ -375,7 +415,7 @@ async def _seed_default_data():
                 "email": "auditor@securepam.local",
                 "full_name": "Bob Auditor",
                 "password": "auditor123",
-                "mfa_enabled": False,
+                "mfa_enabled": True,
                 "role": auditor_role,
             },
         ]

@@ -3,6 +3,12 @@ Vault Reference model — tracks which assets/applications have secrets stored i
 
 IMPORTANT: This table stores REFERENCES to vault paths, NOT the secrets themselves.
 Secrets are retrieved on-demand from Vault and passed directly to gateways.
+
+`vault_path` is relative to the provider's KV mount (no "secret/" and no
+"data/" segment) and must sit under OPENBAO_SECRET_PATH_PREFIX — see
+app/secret_providers/paths.py. It is only ever written by the admin
+credential-ref API, which derives it server-side; CredentialService
+re-validates it on every read.
 """
 
 import uuid
@@ -27,10 +33,21 @@ class VaultRef(Base, UUIDMixin, TimestampMixin):
         UUID(as_uuid=True), ForeignKey("applications.id", ondelete="CASCADE"), nullable=True, index=True
     )
 
+    # Which provider holds the secret. Must match the running
+    # SECRET_PROVIDER, or retrieval is refused (no cross-provider fallback).
+    provider: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="openbao", server_default="openbao",
+        comment="openbao, mock"
+    )
+
     # Vault path reference — NOT the secret
     vault_path: Mapped[str] = mapped_column(
         String(512), nullable=False,
-        comment="Vault path like secret/targets/WIN-PROD-01"
+        comment="Path relative to the KV mount, like securepam/assets/test-linux-01"
+    )
+    secret_version: Mapped[Optional[int]] = mapped_column(
+        nullable=True,
+        comment="Pinned KV v2 version; null reads the latest"
     )
 
     # Secret metadata

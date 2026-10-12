@@ -11,19 +11,19 @@ Provides service health for:
 """
 
 import time
-from typing import List, Optional
+from typing import List
 
-import httpx
 from fastapi import APIRouter, Depends, Response, status
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.core.deps import get_db
+from app.core.logging import get_logger
 from app.schemas.common import DetailedHealthCheck, HealthCheck, LivenessCheck, ReadinessCheck, ServiceHealth
-from app.secrets.openbao import runtime_vault_token
 
 router = APIRouter(tags=["health"])
+logger = get_logger(__name__)
 
 
 @router.get("/health", response_model=HealthCheck)
@@ -82,7 +82,7 @@ async def detailed_health_check(db: AsyncSession = Depends(get_db)):
     services.append(idp_health)
 
     # Vault
-    vault_health = _check_vault()
+    vault_health = await _check_vault()
     services.append(vault_health)
 
     # Gateway
@@ -112,6 +112,14 @@ async def detailed_health_check(db: AsyncSession = Depends(get_db)):
     )
 
 
+def _log_unhealthy(service: str, exc: Exception) -> str:
+    """Health endpoints are unauthenticated: log the real error server-side
+    and return only a generic message (exception text can carry hostnames,
+    usernames or driver internals)."""
+    logger.warning("health_check_failed", service=service, error_type=type(exc).__name__, exc_info=True)
+    return f"{service} unreachable"
+
+
 async def _check_database(db: AsyncSession) -> ServiceHealth:
     """Check PostgreSQL connectivity."""
     try:
@@ -127,7 +135,7 @@ async def _check_database(db: AsyncSession) -> ServiceHealth:
         return ServiceHealth(
             service="database",
             status="unhealthy",
-            details=str(e),
+            details=_log_unhealthy("database", e),
         )
 
 
@@ -150,7 +158,7 @@ async def _check_redis() -> ServiceHealth:
         return ServiceHealth(
             service="redis",
             status="unhealthy",
-            details=str(e),
+            details=_log_unhealthy("redis", e),
         )
 
 
@@ -169,44 +177,24 @@ def _check_idp() -> ServiceHealth:
     )
 
 
-_OPENBAO_UP = {200, 429, 473}
+async def _check_vault() -> ServiceHealth:
+    """
+    Check the configured secret provider. Reports reachability only: the
+    detail strings come from ProviderHealth, which never includes the token
+    or any secret value. The mock provider is healthy only in DEV_MODE —
+    anywhere else it is reported degraded rather than passed off as real.
+    """
+    from app.secret_providers import get_secret_provider
 
-
-def _check_vault(client: Optional[httpx.Client] = None) -> ServiceHealth:
-    """Check OpenBao. Disabled mode does not call the network."""
-    if not settings.VAULT_ENABLED and not runtime_vault_token():
-        if settings.DEV_MODE:
-            return ServiceHealth(
-                service="vault",
-                status="healthy",
-                details="DEV_MODE: MockVault active",
-            )
-        return ServiceHealth(
-            service="vault",
-            status="degraded",
-            details="OpenBao disabled",
-        )
-
-    owns_client = client is None
-    if client is None:
-        client = httpx.Client(timeout=2.0)
-    status_code: Optional[int] = None
-    try:
-        response = client.get(f"{settings.VAULT_URL.rstrip('/')}/v1/sys/health")
-        status_code = response.status_code
-    except httpx.TimeoutException:
-        return ServiceHealth(service="vault", status="unhealthy", details="OpenBao request timed out")
-    except httpx.HTTPError:
-        return ServiceHealth(service="vault", status="unhealthy", details="OpenBao unreachable")
-    finally:
-        if owns_client:
-            client.close()
-
-    if status_code in _OPENBAO_UP:
-        return ServiceHealth(service="vault", status="healthy", details="OpenBao reachable")
-    if status_code == 503:
-        return ServiceHealth(service="vault", status="unhealthy", details="OpenBao sealed")
-    return ServiceHealth(service="vault", status="unhealthy", details="OpenBao unavailable")
+    result = await get_secret_provider().health()
+    if result.provider == "mock" and result.healthy and not settings.DEV_MODE:
+        return ServiceHealth(service="vault", status="degraded", details="Mock secret provider active outside DEV_MODE")
+    return ServiceHealth(
+        service="vault",
+        status="healthy" if result.healthy else "unhealthy",
+        latency_ms=result.latency_ms,
+        details=f"{result.provider}: {result.detail}",
+    )
 
 
 def _check_gateway() -> ServiceHealth:
