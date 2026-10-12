@@ -5,9 +5,30 @@ All settings are loaded from environment variables.
 Secrets must never have default values in production.
 """
 
-from typing import List
+import re
+from pathlib import Path
+from typing import List, Literal
+from urllib.parse import urlsplit
+
 from pydantic_settings import BaseSettings
-from pydantic import field_validator
+from pydantic import SecretStr, field_validator, model_validator
+
+# backend/ — .env is resolved relative to this, not to the process CWD, so
+# `uvicorn` / `alembic` / `pytest` all read the same file no matter where
+# they're launched from.
+BACKEND_DIR = Path(__file__).resolve().parents[2]
+
+# One or more slash-separated segments of safe characters. Used for the KV
+# mount point and the server-side secret path prefix — never "..", never a
+# leading/trailing slash.
+_SAFE_PATH_RE = re.compile(r"^[A-Za-z0-9_.-]+(/[A-Za-z0-9_.-]+)*$")
+
+
+class SettingsError(Exception):
+    """Invalid configuration. Deliberately NOT a ValueError: pydantic wraps
+    ValueErrors in a ValidationError whose message embeds the raw input
+    (including OPENBAO_TOKEN); a non-ValueError propagates as-is, carrying
+    only the sanitized message built below."""
 
 
 class Settings(BaseSettings):
@@ -51,7 +72,22 @@ class Settings(BaseSettings):
     KEYCLOAK_MFA_SYNC_INTERVAL_SECONDS: int = 60
     KEYCLOAK_MFA_SYNC_LOOKBACK_HOURS: int = 1
 
-    # --- Vault ---
+    # --- Secret provider (credential retrieval) ---
+    # "mock" serves fake credentials only and is refused in production.
+    # "openbao" requires OPENBAO_ADDR + OPENBAO_TOKEN; if either is missing
+    # or invalid, startup fails — there is no silent fallback to mock.
+    SECRET_PROVIDER: Literal["mock", "openbao"] = "mock"
+    OPENBAO_ADDR: str = ""
+    OPENBAO_MOUNT_POINT: str = "secret"
+    OPENBAO_TOKEN: SecretStr = SecretStr("")
+    # Every credential reference must live under <mount>/data/<prefix>/...
+    OPENBAO_SECRET_PATH_PREFIX: str = "securepam"
+    OPENBAO_CONNECT_TIMEOUT_SECONDS: float = 3.0
+    OPENBAO_REQUEST_TIMEOUT_SECONDS: float = 5.0
+    # Optional CA bundle path for a TLS-terminated OpenBao; empty = system CAs.
+    OPENBAO_CA_CERT: str = ""
+
+    # --- Vault (legacy, superseded by SECRET_PROVIDER / OPENBAO_*) ---
     VAULT_URL: str = "http://vault:8200"
     VAULT_TOKEN: str = ""
     VAULT_MOUNT_PATH: str = "secret"
@@ -115,8 +151,62 @@ class Settings(BaseSettings):
         # In production, enforce a real secret key
         return v
 
+    @field_validator("SECRET_PROVIDER", mode="before")
+    @classmethod
+    def normalize_secret_provider(cls, v):
+        return v.strip().lower() if isinstance(v, str) else v
+
+    @model_validator(mode="after")
+    def validate_secret_provider(self) -> "Settings":
+        # Messages name the offending setting but never echo a token value.
+        errors: List[str] = []
+        production = self.ENVIRONMENT.lower() == "production"
+
+        if self.SECRET_PROVIDER == "mock":
+            if production:
+                errors.append("SECRET_PROVIDER=mock is not allowed when ENVIRONMENT=production")
+        else:
+            token = self.OPENBAO_TOKEN.get_secret_value()
+            if not token.strip():
+                errors.append("OPENBAO_TOKEN is required when SECRET_PROVIDER=openbao")
+            elif not token.isprintable() or any(c.isspace() for c in token):
+                errors.append("OPENBAO_TOKEN contains whitespace or non-printable characters")
+
+            if not self.OPENBAO_ADDR.strip():
+                errors.append("OPENBAO_ADDR is required when SECRET_PROVIDER=openbao")
+            else:
+                try:
+                    parts = urlsplit(self.OPENBAO_ADDR)
+                    valid = (
+                        parts.scheme in ("http", "https")
+                        and bool(parts.hostname)
+                        and parts.path in ("", "/")
+                        and not parts.query
+                        and not parts.fragment
+                        and parts.username is None
+                        and parts.password is None
+                    )
+                    parts.port  # raises ValueError on a malformed port
+                except ValueError:
+                    valid = False
+                if not valid:
+                    errors.append("OPENBAO_ADDR must be a plain http(s)://host[:port] URL")
+                elif production and parts.scheme != "https":
+                    errors.append("OPENBAO_ADDR must use https when ENVIRONMENT=production")
+
+            if not _SAFE_PATH_RE.match(self.OPENBAO_MOUNT_POINT) or ".." in self.OPENBAO_MOUNT_POINT:
+                errors.append("OPENBAO_MOUNT_POINT is invalid")
+            if not _SAFE_PATH_RE.match(self.OPENBAO_SECRET_PATH_PREFIX) or ".." in self.OPENBAO_SECRET_PATH_PREFIX:
+                errors.append("OPENBAO_SECRET_PATH_PREFIX is invalid")
+            if self.OPENBAO_CONNECT_TIMEOUT_SECONDS <= 0 or self.OPENBAO_REQUEST_TIMEOUT_SECONDS <= 0:
+                errors.append("OPENBAO_*_TIMEOUT_SECONDS must be positive")
+
+        if errors:
+            raise SettingsError("; ".join(errors))
+        return self
+
     model_config = {
-        "env_file": ".env",
+        "env_file": str(BACKEND_DIR / ".env"),
         "env_file_encoding": "utf-8",
         "case_sensitive": True,
         # .env also carries vars consumed only by docker-compose / other

@@ -18,6 +18,10 @@ os.environ.setdefault(
 os.environ.setdefault("REDIS_URL", "redis://localhost:6379/0")
 os.environ["DEV_MODE"] = "true"
 os.environ["ENVIRONMENT"] = "test"
+# Ordinary tests never talk to a real OpenBao, even if backend/.env selects
+# it — live tests (tests/test_openbao_live.py) are opt-in and build their
+# own provider from OPENBAO_LIVE_* variables.
+os.environ["SECRET_PROVIDER"] = "mock"
 
 from typing import AsyncGenerator, List  # noqa: E402
 

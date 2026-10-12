@@ -341,11 +341,200 @@ only exposes create/read/cancel.
   (see `app/schemas/access_requests.py`); there's no value to "ignore"
   because there's no field to accept it into.
 
+## Credential management (OpenBao)
+
+SecurePAM never stores credentials. PostgreSQL's `vault_refs` table holds
+only a **reference** — provider name, a server-derived path, the asset it
+belongs to, an optional pinned KV v2 version, the (non-secret) username
+and timestamps. The secret itself lives in OpenBao and is read on demand,
+in-process, only for an authorized session.
+
+```
+gateway (future RDP/SSH) ──▶ CredentialService.checkout()
+                               1. user active + sessions:create
+                               2. access request: owner, target, ACTIVE, approval
+                               3. asset: exists, enabled, status ACTIVE
+                               4. JIT grant: bound to request/user/asset/protocol, live
+                               5. session (optional): bound to all of the above, live
+                               6. exactly one active vault_ref, provider matches
+                             ──▶ SecretProvider.read_secret()   (only after 1–6 pass)
+                             ──▶ Credential (redacted repr, wiped on context exit)
+```
+
+| Component | Location |
+|---|---|
+| Settings + fail-safe validation | `backend/app/core/config.py` |
+| `SecretProvider` interface, exceptions, `Credential` | `backend/app/secret_providers/base.py` |
+| `OpenBaoSecretProvider` (KV v2 over async httpx) | `backend/app/secret_providers/openbao.py` |
+| `MockSecretProvider` (fake values only) | `backend/app/secret_providers/mock.py` |
+| Path rules (prefix, no traversal) | `backend/app/secret_providers/paths.py` |
+| Authorization + audit before retrieval | `backend/app/services/credential_service.py` |
+| Admin reference management (no secrets) | `backend/app/api/v1/credential_refs.py` |
+
+There is deliberately **no HTTP endpoint that returns a credential**. A
+future gateway calls the service directly:
+
+```python
+from app.services.credential_service import CheckoutRequest, CredentialService
+
+async with CredentialService().checkout(db, CheckoutRequest(
+    user_id=user.id, access_request_id=req.id, jit_grant_id=grant.id,
+    asset_id=asset.id, session_id=session.id, source_ip=ip,
+)) as cred:
+    handshake(username=cred.username, password=cred.reveal())
+# cred is wiped here; CredentialAccessDenied / CredentialUnavailable otherwise
+```
+
+### Provider selection
+
+| `SECRET_PROVIDER` | Behavior |
+|---|---|
+| `mock` (default) | In-memory fake credentials. Refused at startup when `ENVIRONMENT=production`; health shows `degraded` outside `DEV_MODE`. |
+| `openbao` | Requires `OPENBAO_ADDR` and `OPENBAO_TOKEN`. Missing or invalid values fail **at startup** (`SettingsError`) — the app never silently switches to mock. `ENVIRONMENT=production` also requires `https://`. |
+
+A `vault_refs` row records which provider it was registered against;
+retrieval refuses a row whose provider differs from the running one.
+
+### Environment variables
+
+Set these in **`backend/.env`** (git-ignored; Settings resolves it
+relative to `backend/`, regardless of the working directory):
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `SECRET_PROVIDER` | `mock` | `mock` or `openbao` |
+| `OPENBAO_ADDR` | — | `http(s)://host:port`, no path/credentials |
+| `OPENBAO_MOUNT_POINT` | `secret` | KV v2 mount |
+| `OPENBAO_TOKEN` | — | The **restricted** app token (below). Held as a `SecretStr`; never logged, echoed in errors, or sent to the health endpoint |
+| `OPENBAO_SECRET_PATH_PREFIX` | `securepam` | Every reference must sit under `<mount>/data/<prefix>/…` |
+| `OPENBAO_CONNECT_TIMEOUT_SECONDS` / `OPENBAO_REQUEST_TIMEOUT_SECONDS` | `3` / `5` | Separate connect/request timeouts |
+| `OPENBAO_CA_CERT` | empty | CA bundle path for TLS with a private CA |
+
+The older `VAULT_*` variables are superseded and no longer read by the
+backend (the optional compose `vault` lab container still uses `VAULT_TOKEN`).
+Under docker-compose, `127.0.0.1` is the container itself — point
+`OPENBAO_ADDR` at `http://host.docker.internal:8200` for a host-run OpenBao.
+
+### KV v2 path conventions
+
+- Stored reference (`vault_refs.vault_path`) is **relative to the mount**:
+  `securepam/assets/<secret-name>` — e.g. `securepam/assets/test-linux-01`.
+- CLI form: `bao kv get secret/securepam/assets/test-linux-01`.
+- HTTP / policy form inserts `data/`: `secret/data/securepam/assets/test-linux-01`.
+- Expected keys: `username` (optional, falls back to the ref's username)
+  plus `password` (PASSWORD), `private_key` (SSH_KEY), `api_key`, or
+  `certificate`.
+- Paths are never accepted from clients. Admins register a reference with
+  a single validated **name** and the server derives the path:
+
+```bash
+curl -X PUT http://localhost:8000/api/v1/assets/<asset-id>/credential-ref \
+  -H "Authorization: Bearer $ADMIN_JWT" -H "Content-Type: application/json" \
+  -d '{"secret_name": "test-linux-01", "username": "fakeuser", "secret_type": "PASSWORD"}'
+```
+
+`GET` (`vault:read`) and `DELETE` (deactivate, `vault:manage`) use the
+same URL; all three are ADMIN-only with the seeded roles and audited
+(`CREDENTIAL_REF_SET` / `CREDENTIAL_REF_DEACTIVATED`).
+
+### Local OpenBao development setup
+
+```bash
+bao server -dev                                    # terminal 1 — prints a ROOT token
+export BAO_ADDR=http://127.0.0.1:8200              # terminal 2, using the root token
+bao kv put secret/securepam/assets/test-linux-01 username=fakeuser password='fake-only'
+```
+
+Restricted policy — the smallest grant the app needs (read data only):
+
+```bash
+bao policy write securepam-read - <<'EOF'
+path "secret/data/securepam/assets/*" {
+  capabilities = ["read"]
+}
+EOF
+
+# Application token: restricted policy only, no default policy, renewable, bounded.
+bao token create -policy=securepam-read -no-default-policy \
+  -ttl=24h -display-name=securepam-backend -field=token
+```
+
+Paste that token into `backend/.env` as `OPENBAO_TOKEN=` (with
+`SECRET_PROVIDER=openbao`). Never use the root token as `OPENBAO_TOKEN`.
+
+Verified with this policy (`tests/test_openbao_live.py`): read of the
+asset path → 200; write/patch/delete/destroy/metadata changes → 403; reads
+outside `securepam/assets/` → 403; `sys/mounts`, `sys/policies`, `sys/auth`,
+`auth/token/create` → 403. `bao kv get` works even with
+`-no-default-policy`: the CLI's preflight `sys/internal/ui/mounts/...`
+lookup is allowed for any token holding a capability under the mount.
+
+### Troubleshooting a 403 from `bao kv get`
+
+The error text tells you which layer refused:
+
+| Error text | Meaning | Fix |
+|---|---|---|
+| `preflight capability check returned 403 … secret/securepam/...` | Token has **no** capability anywhere under the mount — usually the token is bound to a misspelled/nonexistent policy, or the policy is empty | `bao token lookup` (as the restricted token) → check `policies`; re-create token with the exact policy name |
+| `Error reading secret/data/securepam/...: … permission denied` | Mount discovery passed; the data read was refused — policy path is wrong (e.g. missing `data/`, or `metadata/`/`list` only) | Policy must name `secret/data/securepam/assets/*` with `read` |
+| `permission denied` with no `Error reading …` line | Token invalid or expired | Create a new token; check `ttl` |
+| `URL: GET …/sys/internal/ui/mounts/…` + 403 and an empty token | `BAO_TOKEN` is empty/unset in that shell | `printenv BAO_TOKEN \| wc -c` (length only — don't print it) |
+| `configured Vault token contains non-printable characters` | Captured full `bao token create` table instead of `-field=token` | Re-create with `-field=token` |
+
+### Secret-handling rules
+
+- No credential value in PostgreSQL, HTTP responses, health output,
+  exceptions, audit metadata, or logs — tests sweep for planted canary
+  values across all of these.
+- Audit events: `CREDENTIAL_RETRIEVAL_ATTEMPTED`, then `CREDENTIAL_RETRIEVED`,
+  `CREDENTIAL_RETRIEVAL_DENIED` (with a reason code such as
+  `JIT_GRANT_EXPIRED`, `ACCESS_REQUEST_USER_MISMATCH`, `PROVIDER_MISMATCH`),
+  or `CREDENTIAL_RETRIEVAL_FAILED` (`PROVIDER_UNAVAILABLE`,
+  `PROVIDER_ACCESS_DENIED`, …). Metadata carries IDs, the reference path,
+  provider and version only.
+- Fail closed: any authorization failure, missing/ambiguous reference, or
+  provider error raises — no partial data, no fallback provider.
+- `Credential` has a redacted `repr`, refuses pickling, and is wiped when
+  the `checkout()` block exits. Python can't zero an immutable `str` in
+  place, so this limits lifetime by dropping references rather than
+  scrubbing memory.
+- The OpenBao client sends the token only as the `X-Vault-Token` header,
+  does not follow redirects, ignores proxy/netrc environment, and raises
+  exceptions without the HTTP cause chained in.
+- `backend/.dockerignore` keeps `backend/.env` out of built images.
+
+### Remaining production-hardening requirements
+
+The local `bao server -dev` instance is **not** production: it is
+in-memory, auto-unsealed, plain HTTP, and its root token is printed to the
+terminal. Before production:
+
+- Run OpenBao with persistent storage (integrated Raft), TLS everywhere
+  (`https://` is enforced when `ENVIRONMENT=production`), and real
+  seal/unseal (Shamir or auto-unseal via KMS/HSM); revoke the initial root token.
+- Replace the static `OPENBAO_TOKEN` with a machine auth method
+  (AppRole with response-wrapped secret IDs, Kubernetes, or JWT/OIDC) and
+  short-lived, auto-renewed tokens; this needs a token-renewal loop that
+  the current provider does not implement.
+- Enable an OpenBao audit device and ship it to the SIEM alongside
+  SecurePAM's own audit log.
+- Rotation: `last_rotated` / `rotation_interval_days` exist on
+  `vault_refs` but nothing rotates yet; consider dynamic secrets
+  (e.g. SSH CA / database engines) instead of static passwords.
+- MFA-at-checkout: `access_requests.mfa_required` is recorded but not
+  re-verified at retrieval time, because DevAuth carries no MFA claim;
+  enforce it once Keycloak/OIDC lands.
+- Connection pooling: the provider opens a client per read, which is
+  fine at current volume but should become a shared, lifespan-managed client.
+- The gateways that call `checkout()` (RDP via Guacamole, SSH) still need
+  to be built, and must create a bound `sessions` row first.
+
 ## Tech stack
 
 - **Backend:** Python, FastAPI (async), SQLAlchemy 2.0 (async), Alembic, PostgreSQL, Redis, structlog
 - **Frontend:** React, TypeScript, Vite, Tailwind, React Router, TanStack Query, axios
-- **Future:** Keycloak (OIDC), OpenBao/Vault, Apache Guacamole, NGINX, Wazuh
+- **Secrets:** OpenBao (KV v2) via `SECRET_PROVIDER=openbao`; mock provider for dev/tests
+- **Future:** Keycloak (OIDC), Apache Guacamole, NGINX, Wazuh
 
 ## Local setup
 
@@ -461,6 +650,7 @@ placeholder values (no real secrets). Key ones for local dev:
 | `SECRET_KEY` | Signs DevAuth JWTs — change in any non-local environment |
 | `LOG_LEVEL`, `DEBUG` | `DEBUG=true` also raises the `sqlalchemy.engine` logger to INFO |
 | `BACKEND_CORS_ORIGINS` | Must include whatever origin the frontend is actually served from |
+| `SECRET_PROVIDER`, `OPENBAO_*` | Credential provider — see [Credential management (OpenBao)](#credential-management-openbao) |
 
 Variables prefixed `POSTGRES_`, `REDIS_HOST`/`REDIS_PORT`, `NGINX_*`,
 `GRAFANA_*` exist only for `docker-compose.yml`'s other services —
@@ -536,7 +726,11 @@ routes, role-based nav, Assets/Applications/Policies pages, and now
 Access Requests (list/create/detail/cancel) and an Approvals queue —
 all real API data, no fake numbers anywhere.
 
-Not implemented: Keycloak/OIDC, Vault/OpenBao, Guacamole (RDP), SSH
+Phase 5 adds OpenBao KV v2 credential references and `CredentialService`
+(authorized, audited, backend-only retrieval for future gateways) — see
+[Credential management (OpenBao)](#credential-management-openbao).
+
+Not implemented: Keycloak/OIDC, OpenBao rotation/dynamic secrets, Guacamole (RDP), SSH
 gateway, web reverse proxy, isolated browser, session recording,
 Wazuh/SIEM, Users/Roles CRUD, a JIT REST endpoint (deliberately — see
 the JIT lifecycle section above), and a background sweep for

@@ -80,7 +80,7 @@ async def detailed_health_check(db: AsyncSession = Depends(get_db)):
     services.append(idp_health)
 
     # Vault
-    vault_health = _check_vault()
+    vault_health = await _check_vault()
     services.append(vault_health)
 
     # Gateway
@@ -167,18 +167,23 @@ def _check_idp() -> ServiceHealth:
     )
 
 
-def _check_vault() -> ServiceHealth:
-    """Check Vault/OpenBao status."""
-    if settings.DEV_MODE or not settings.VAULT_ENABLED:
-        return ServiceHealth(
-            service="vault",
-            status="healthy",
-            details="DEV_MODE: MockVault active",
-        )
+async def _check_vault() -> ServiceHealth:
+    """
+    Check the configured secret provider. Reports reachability only: the
+    detail strings come from ProviderHealth, which never includes the token
+    or any secret value. The mock provider is healthy only in DEV_MODE —
+    anywhere else it is reported degraded rather than passed off as real.
+    """
+    from app.secret_providers import get_secret_provider
+
+    result = await get_secret_provider().health()
+    if result.provider == "mock" and result.healthy and not settings.DEV_MODE:
+        return ServiceHealth(service="vault", status="degraded", details="Mock secret provider active outside DEV_MODE")
     return ServiceHealth(
         service="vault",
-        status="degraded",
-        details="Vault not yet configured",
+        status="healthy" if result.healthy else "unhealthy",
+        latency_ms=result.latency_ms,
+        details=f"{result.provider}: {result.detail}",
     )
 
 
