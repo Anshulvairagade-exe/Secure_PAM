@@ -193,3 +193,63 @@ async def test_invalid_sort_order_returns_422(
         headers=auth_header(admin_token),
     )
     assert resp.status_code == 422
+
+
+async def test_zero_page_is_clamped_to_first_page(
+    client: AsyncClient, admin_token: str
+):
+    resp = await client.get(
+        "/api/v1/assets",
+        params={"page": 0},
+        headers=auth_header(admin_token),
+    )
+    assert resp.status_code == 200
+    assert resp.json()["page"] == 1
+
+
+async def test_negative_page_is_clamped_to_first_page(
+    client: AsyncClient, admin_token: str
+):
+    resp = await client.get(
+        "/api/v1/assets",
+        params={"page": -1},
+        headers=auth_header(admin_token),
+    )
+    assert resp.status_code == 200
+    assert resp.json()["page"] == 1
+
+
+async def test_oversized_page_size_is_capped_at_100(
+    client: AsyncClient, admin_token: str
+):
+    resp = await client.get(
+        "/api/v1/assets",
+        params={"page_size": 10000},
+        headers=auth_header(admin_token),
+    )
+    assert resp.status_code == 200
+    assert resp.json()["page_size"] == 100
+
+
+async def test_zero_page_size_is_clamped_to_one(
+    client: AsyncClient, admin_token: str
+):
+    resp = await client.get(
+        "/api/v1/assets",
+        params={"page_size": 0},
+        headers=auth_header(admin_token),
+    )
+    assert resp.status_code == 200
+    assert resp.json()["page_size"] == 1
+
+
+async def test_negative_page_size_is_clamped_to_one(
+    client: AsyncClient, admin_token: str
+):
+    resp = await client.get(
+        "/api/v1/assets",
+        params={"page_size": -1},
+        headers=auth_header(admin_token),
+    )
+    assert resp.status_code == 200
+    assert resp.json()["page_size"] == 1
