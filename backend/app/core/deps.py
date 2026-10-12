@@ -155,11 +155,16 @@ class PermissionChecker:
 
     Usage:
         @router.post("/assets", dependencies=[Depends(PermissionChecker("assets", "create"))])
+
+    Extra actions are alternatives — any one of them suffices, e.g.
+    PermissionChecker("sessions", "read", "read_own"). Object-level scoping
+    (own vs. all) is then the route's job.
     """
 
-    def __init__(self, resource: str, action: str):
+    def __init__(self, resource: str, action: str, *alternatives: str):
         self.resource = resource
         self.action = action
+        self.actions = (action, *alternatives)
 
     async def __call__(
         self,
@@ -167,9 +172,9 @@ class PermissionChecker:
         current_user: User = Depends(get_current_active_user),
         db: AsyncSession = Depends(get_db),
     ) -> User:
-        required = f"{self.resource}:{self.action}"
+        required = " | ".join(f"{self.resource}:{a}" for a in self.actions)
 
-        if not user_has_permission(current_user, self.resource, self.action):
+        if not any(user_has_permission(current_user, self.resource, a) for a in self.actions):
             await write_audit_log(
                 db,
                 actor=current_user,
