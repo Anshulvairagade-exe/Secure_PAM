@@ -45,7 +45,10 @@ class Settings(BaseSettings):
     KEYCLOAK_ADMIN_USER: str = "admin"
     KEYCLOAK_ADMIN_PASSWORD: str = ""
 
-    # --- Vault ---
+    # --- OpenBao / Vault-compatible API ---
+    # VAULT_TOKEN is the least-privilege runtime token. Never set it to the
+    # lab root token (OPENBAO_DEV_ROOT_TOKEN_ID), which is Compose-only and
+    # is intentionally not a Settings field.
     VAULT_URL: str = "http://vault:8200"
     VAULT_TOKEN: str = ""
     VAULT_MOUNT_PATH: str = "secret"

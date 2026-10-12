@@ -6,6 +6,7 @@
 .env
 .env.local
 .env.production
+infrastructure/openbao/runtime/
 *.pem
 *.key
 *.crt
