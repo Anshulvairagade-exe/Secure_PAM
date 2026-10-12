@@ -182,3 +182,14 @@ async def test_sort_by_disallowed_column_is_ignored_not_errored(client: AsyncCli
         "/api/v1/assets", params={"sort_by": "ip_address"}, headers=auth_header(admin_token)
     )
     assert resp.status_code == 200
+
+
+async def test_invalid_sort_order_returns_422(
+    client: AsyncClient, admin_token: str
+):
+    resp = await client.get(
+        "/api/v1/assets",
+        params={"sort_order": "invalid"},
+        headers=auth_header(admin_token),
+    )
+    assert resp.status_code == 422
