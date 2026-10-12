@@ -439,6 +439,16 @@ same URL; all three are ADMIN-only with the seeded roles and audited
 
 ### Local OpenBao development setup
 
+The lab Compose profile starts OpenBao and applies `securepam-read` for you:
+
+```bash
+docker compose --profile lab up openbao openbao-init
+```
+
+That writes the synthetic secret `secret/securepam/assets/test-linux-01` and a non-root token into the `openbao_runtime` volume. When the backend container sees that file, it sets `SECRET_PROVIDER=openbao` and `OPENBAO_TOKEN` from the file. Do not paste the dev root token into `OPENBAO_TOKEN`.
+
+To do the same steps by hand:
+
 ```bash
 bao server -dev                                    # terminal 1 — prints a ROOT token
 export BAO_ADDR=http://127.0.0.1:8200              # terminal 2, using the root token
