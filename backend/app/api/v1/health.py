@@ -11,8 +11,9 @@ Provides service health for:
 """
 
 import time
-from typing import List
+from typing import List, Optional
 
+import httpx
 from fastapi import APIRouter, Depends, Response, status
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -167,19 +168,44 @@ def _check_idp() -> ServiceHealth:
     )
 
 
-def _check_vault() -> ServiceHealth:
-    """Check Vault/OpenBao status."""
-    if settings.DEV_MODE or not settings.VAULT_ENABLED:
+_OPENBAO_UP = {200, 429, 473}
+
+
+def _check_vault(client: Optional[httpx.Client] = None) -> ServiceHealth:
+    """Check OpenBao. Disabled mode does not call the network."""
+    if not settings.VAULT_ENABLED:
+        if settings.DEV_MODE:
+            return ServiceHealth(
+                service="vault",
+                status="healthy",
+                details="DEV_MODE: MockVault active",
+            )
         return ServiceHealth(
             service="vault",
-            status="healthy",
-            details="DEV_MODE: MockVault active",
+            status="degraded",
+            details="OpenBao disabled",
         )
-    return ServiceHealth(
-        service="vault",
-        status="degraded",
-        details="Vault not yet configured",
-    )
+
+    owns_client = client is None
+    if client is None:
+        client = httpx.Client(timeout=2.0)
+    status_code: Optional[int] = None
+    try:
+        response = client.get(f"{settings.VAULT_URL.rstrip('/')}/v1/sys/health")
+        status_code = response.status_code
+    except httpx.TimeoutException:
+        return ServiceHealth(service="vault", status="unhealthy", details="OpenBao request timed out")
+    except httpx.HTTPError:
+        return ServiceHealth(service="vault", status="unhealthy", details="OpenBao unreachable")
+    finally:
+        if owns_client:
+            client.close()
+
+    if status_code in _OPENBAO_UP:
+        return ServiceHealth(service="vault", status="healthy", details="OpenBao reachable")
+    if status_code == 503:
+        return ServiceHealth(service="vault", status="unhealthy", details="OpenBao sealed")
+    return ServiceHealth(service="vault", status="unhealthy", details="OpenBao unavailable")
 
 
 def _check_gateway() -> ServiceHealth:
