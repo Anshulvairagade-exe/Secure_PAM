@@ -10,15 +10,16 @@ Security Controls:
 - No Automatic TOFU: Blind trust-on-first-use is disallowed; keys must be pre-provisioned.
 - Never Insecure: Disabling verification (`known_hosts=None`) or trusting client-supplied
   fingerprints is forbidden.
-- Zero Migrations: Utilizes OpenSSH known_hosts format, filesystem paths, and Redis key
-  registries without requiring PostgreSQL schema alterations.
+- Operator-provisioned only: trusted keys come from known_hosts data supplied in
+  code/configuration or the SECUREPAM_KNOWN_HOSTS_PATH file. Redis is not a
+  trust source: anyone able to write it could otherwise plant a key and
+  impersonate a target.
 """
 
 import os
 from typing import Optional, Union
 
 import asyncssh
-from redis.exceptions import RedisError
 
 from app.models.asset import Asset
 
@@ -42,21 +43,17 @@ class SSHHostKeyStorageError(SSHHostKeyError):
 class SSHHostKeyValidator:
     """
     Validates upstream SSH host keys against an explicitly provisioned OpenSSH
-    known-hosts configuration or trusted Redis registry.
+    known-hosts configuration (data or file).
     """
-
-    REDIS_KEY_PREFIX = "ssh:known_hosts:"
 
     def __init__(
         self,
         *,
         known_hosts_data: Optional[str] = None,
         known_hosts_path: Optional[str] = None,
-        redis_client=None,
     ) -> None:
         self._known_hosts_data = known_hosts_data
         self._known_hosts_path = known_hosts_path
-        self._redis = redis_client
         self._cached_known_hosts: Optional[asyncssh.SSHKnownHosts] = None
 
         if known_hosts_data:
@@ -81,24 +78,6 @@ class SSHHostKeyValidator:
 
         return None
 
-    async def _get_redis_known_hosts(self, asset: Asset) -> Optional[asyncssh.SSHKnownHosts]:
-        if self._redis is None:
-            return None
-
-        key = f"{self.REDIS_KEY_PREFIX}{asset.id}"
-        try:
-            raw_entry = await self._redis.get(key)
-        except RedisError as exc:
-            raise SSHHostKeyStorageError(f"Redis unavailable while querying host key: {exc}") from exc
-
-        if raw_entry:
-            try:
-                return asyncssh.import_known_hosts(raw_entry)
-            except Exception as exc:
-                raise SSHHostKeyStorageError(f"Malformed host key entry in Redis: {exc}") from exc
-
-        return None
-
     async def get_trusted_known_hosts_for_asset(self, asset: Asset) -> asyncssh.SSHKnownHosts:
         """
         Resolve the trusted known-hosts configuration for an asset.
@@ -111,14 +90,7 @@ class SSHHostKeyValidator:
             if matches:
                 return kh
 
-        # 2. Check Redis trusted host key registry
-        redis_kh = await self._get_redis_known_hosts(asset)
-        if redis_kh is not None:
-            matches, _, _, _, _, _, _ = redis_kh.match(asset.hostname, asset.ip_address, asset.port)
-            if matches:
-                return redis_kh
-
-        # 3. Fail closed: No trusted key registered for this asset
+        # 2. Fail closed: No trusted key registered for this asset
         raise SSHHostKeyUnknownError(
             f"No trusted host key configured for target asset '{asset.name}' "
             f"({asset.hostname}:{asset.port}). Connection rejected."

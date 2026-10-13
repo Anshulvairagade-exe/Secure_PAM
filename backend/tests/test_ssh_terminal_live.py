@@ -22,6 +22,7 @@ import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import select
 
+from app.core.config import settings
 from app.core.security import generate_session_number
 from app.database.session import async_session_factory
 from app.main import app
@@ -156,7 +157,7 @@ async def _seed_live_scenario(db, port: int, known_hosts_line: str, expires_in_s
     asset.hostname = "127.0.0.1"
     asset.ip_address = "127.0.0.1"
     asset.port = port
-    asset.recording_required = True
+    asset.recording_required = False  # recording-required paths are tested explicitly
 
     # Adjust grant expiry if needed
     grant = await db.get(JITGrant, sc.jit_grant_id)
@@ -253,10 +254,11 @@ async def test_live_ssh_terminal_bidirectional_and_resize(db_session, operator_t
         assert s.end_time is not None
 
         async with async_session_factory() as db:
-            rec = await db.get(Recording, s.recording_id)
-            # Truthful recording status: since Member 12 stream capture is pending,
-            # recording status is FAILED, not falsely COMPLETED.
-            assert rec.status == "FAILED"
+            # Recording is not required for this target, so no recording is
+            # claimed. (Required-but-unavailable recording is refused by default,
+            # and marked FAILED when explicitly allowed: see
+            # test_truthful_recording_status_pending_then_failed.)
+            assert s.recording_id is None
 
             # Verify CANARY was never recorded in audit logs
             for row in (await db.execute(select(AuditLog))).scalars().all():
@@ -726,7 +728,9 @@ async def test_websocket_db_commit_failure_cleans_up_connection(db_session, oper
 # --- 11. Truthful Recording Status: PENDING during session, FAILED upon completion ---
 
 @pytest.mark.asyncio
-async def test_truthful_recording_status_pending_then_failed(db_session, operator_token, provider):
+async def test_truthful_recording_status_pending_then_failed(db_session, operator_token, provider, monkeypatch):
+    # Recording required, unrecorded sessions explicitly allowed (lab-only setting).
+    monkeypatch.setattr(settings, "SSH_ALLOW_UNRECORDED_SESSIONS", True)
     srv_key = asyncssh.generate_private_key("ssh-ed25519")
     pub_str = srv_key.export_public_key().decode().strip()
     server = ThreadedSSHServer(srv_key)
@@ -738,6 +742,8 @@ async def test_truthful_recording_status_pending_then_failed(db_session, operato
 
     try:
         sc, asset = await _seed_live_scenario(db_session, port, f"127.0.0.1 {pub_str}\n", expires_in_seconds=1800)
+        asset.recording_required = True
+        await db_session.commit()
         client = TestClient(app)
 
         r = client.post(
@@ -815,6 +821,100 @@ async def test_websocket_cancellation_during_pump_cleans_up_connection(db_sessio
             await asyncio.sleep(0.1)
 
         assert gateway.get_live_connection(uuid.UUID(session_id)) is None
+    finally:
+        app.dependency_overrides.pop(get_terminal_gateway, None)
+        server.stop()
+
+
+# --- Termination through the sessions API ends the live terminal ---
+
+async def _live_terminal(db_session, operator_token, port, pub_str):
+    sc, asset = await _seed_live_scenario(db_session, port, f"127.0.0.1 {pub_str}\n", expires_in_seconds=1800)
+    client = TestClient(app)
+    data = client.post(
+        "/api/v1/sessions/ssh/launch",
+        headers=auth_header(operator_token),
+        json={"request_id": str(sc.access_request_id), "asset_id": str(asset.id)},
+    ).json()
+    return client, uuid.UUID(data["session_id"]), data["ticket"]
+
+
+async def _wait_closed(gateway, session_id, seconds=4.0):
+    for _ in range(int(seconds * 10)):
+        if gateway.get_live_connection(session_id) is None:
+            return True
+        await asyncio.sleep(0.1)
+    return False
+
+
+@pytest.mark.asyncio
+async def test_admin_terminate_closes_live_ssh_terminal(db_session, operator_token, admin_token, provider):
+    srv_key = asyncssh.generate_private_key("ssh-ed25519")
+    pub_str = srv_key.export_public_key().decode().strip()
+    server = ThreadedSSHServer(srv_key)
+    port = server.start()
+    gateway = AsyncSSHTerminalGateway(host_key_validator=SSHHostKeyValidator(known_hosts_data=f"127.0.0.1 {pub_str}\n"))
+    app.dependency_overrides[get_terminal_gateway] = lambda: gateway
+    try:
+        client, session_id, ticket = await _live_terminal(db_session, operator_token, port, pub_str)
+        with client.websocket_connect(f"/api/v1/sessions/ssh/{session_id}/ws?ticket={ticket}") as ws:
+            ws.receive_text()
+            assert gateway.get_live_connection(session_id) is not None
+            term = client.post(f"/api/v1/sessions/{session_id}/terminate", headers=auth_header(admin_token))
+            assert term.status_code == 200
+            # The monitor re-reads the session each second, on whichever worker holds the terminal.
+            assert await _wait_closed(gateway, session_id), "terminate left the SSH connection open"
+        async with async_session_factory() as db:
+            assert (await db.get(Session, session_id)).status == "COMPLETED"
+    finally:
+        app.dependency_overrides.pop(get_terminal_gateway, None)
+        server.stop()
+
+
+@pytest.mark.asyncio
+async def test_terminal_closes_when_session_ends_on_another_worker(db_session, operator_token, provider):
+    """Only the session row changes (as when another worker handled the
+    terminate); the monitor must notice and close the terminal."""
+    srv_key = asyncssh.generate_private_key("ssh-ed25519")
+    pub_str = srv_key.export_public_key().decode().strip()
+    server = ThreadedSSHServer(srv_key)
+    port = server.start()
+    gateway = AsyncSSHTerminalGateway(host_key_validator=SSHHostKeyValidator(known_hosts_data=f"127.0.0.1 {pub_str}\n"))
+    app.dependency_overrides[get_terminal_gateway] = lambda: gateway
+    try:
+        client, session_id, ticket = await _live_terminal(db_session, operator_token, port, pub_str)
+        with client.websocket_connect(f"/api/v1/sessions/ssh/{session_id}/ws?ticket={ticket}") as ws:
+            ws.receive_text()
+            assert gateway.get_live_connection(session_id) is not None
+            async with async_session_factory() as db:
+                (await db.get(Session, session_id)).status = "COMPLETED"
+                await db.commit()
+            assert await _wait_closed(gateway, session_id), "monitor did not close the terminal"
+    finally:
+        app.dependency_overrides.pop(get_terminal_gateway, None)
+        server.stop()
+
+
+
+@pytest.mark.asyncio
+async def test_connect_refused_when_recording_became_required(db_session, operator_token, provider):
+    """A session prepared before recording was required cannot be connected afterwards."""
+    srv_key = asyncssh.generate_private_key("ssh-ed25519")
+    pub_str = srv_key.export_public_key().decode().strip()
+    server = ThreadedSSHServer(srv_key)
+    port = server.start()
+    gateway = AsyncSSHTerminalGateway(host_key_validator=SSHHostKeyValidator(known_hosts_data=f"127.0.0.1 {pub_str}\n"))
+    app.dependency_overrides[get_terminal_gateway] = lambda: gateway
+    try:
+        client, session_id, ticket = await _live_terminal(db_session, operator_token, port, pub_str)
+        async with async_session_factory() as db:
+            s = await db.get(Session, session_id)
+            (await db.get(Asset, s.asset_id)).recording_required = True
+            await db.commit()
+        with pytest.raises(Exception):
+            with client.websocket_connect(f"/api/v1/sessions/ssh/{session_id}/ws?ticket={ticket}") as ws:
+                ws.receive_text()
+        assert gateway.get_live_connection(session_id) is None
     finally:
         app.dependency_overrides.pop(get_terminal_gateway, None)
         server.stop()

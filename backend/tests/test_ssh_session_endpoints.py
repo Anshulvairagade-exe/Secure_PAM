@@ -370,12 +370,14 @@ async def test_launch_unexpected_error_fails_closed_without_orphaned_session(
 # --- Successful Orchestration & Truthful State Transitions -------------------
 
 async def test_successful_ssh_launch_orchestration_with_pending_gateway(
-    client, db_session, operator_token, provider
+    client, db_session, operator_token, provider, monkeypatch
 ):
     """
     With the default PendingSSHGateway, the launch succeeds and prepares the session,
     but does NOT falsely mark the session ACTIVE or the recording RECORDING.
+    (Recording is required here, so unrecorded sessions must be explicitly allowed.)
     """
+    monkeypatch.setattr(settings, "SSH_ALLOW_UNRECORDED_SESSIONS", True)
     req = await _ssh_ready(db_session)
     asset = await db_session.get(Asset, req.asset_id)
     asset.recording_required = True
@@ -450,7 +452,7 @@ async def test_successful_ssh_launch_without_recording(client, db_session, opera
 
 
 async def test_connected_gateway_transitions_session_to_active(
-    client, db_session, operator_token, provider
+    client, db_session, operator_token, provider, monkeypatch
 ):
     """
     When a gateway indicates that a real upstream connection was established,
@@ -458,6 +460,7 @@ async def test_connected_gateway_transitions_session_to_active(
     is not yet integrated (pending Member 12), the recording truthfully remains PENDING
     rather than falsely asserting RECORDING.
     """
+    monkeypatch.setattr(settings, "SSH_ALLOW_UNRECORDED_SESSIONS", True)
     app.dependency_overrides[get_ssh_gateway] = lambda: MockConnectedSSHGateway()
     try:
         req = await _ssh_ready(db_session)
@@ -493,3 +496,38 @@ async def test_connected_gateway_transitions_session_to_active(
         assert started.session_id == s.id
     finally:
         app.dependency_overrides.pop(get_ssh_gateway, None)
+
+
+
+# --- Recording required but not available: refused by default --------------
+
+async def test_launch_refused_when_recording_required_but_unavailable(client, db_session, operator_token, provider):
+    req = await _ssh_ready(db_session)
+    asset = await db_session.get(Asset, req.asset_id)
+    asset.recording_required = True
+    await db_session.commit()
+    sessions_before = len((await db_session.execute(select(Session))).scalars().all())
+
+    r = await client.post("/api/v1/sessions/ssh/launch", headers=auth_header(operator_token), json=_launch_body(req))
+    assert r.status_code == 403
+    assert "requires session recording" in r.json()["detail"]
+    (denied,) = await _actions(db_session, "SESSION_LAUNCH_DENIED")
+    assert denied.details["reason"] == "RECORDING_UNAVAILABLE"
+    assert len((await db_session.execute(select(Session))).scalars().all()) == sessions_before
+
+
+async def test_launch_refused_when_request_requires_recording(client, db_session, operator_token, provider):
+    req = await _ssh_ready(db_session)
+    access_request = await db_session.get(AccessRequest, req.access_request_id)
+    access_request.recording_required = True
+    await db_session.commit()
+    r = await client.post("/api/v1/sessions/ssh/launch", headers=auth_header(operator_token), json=_launch_body(req))
+    assert r.status_code == 403
+
+
+def test_production_refuses_unrecorded_ssh_sessions():
+    from app.core.config import Settings, SettingsError
+    with pytest.raises(SettingsError, match="SSH_ALLOW_UNRECORDED_SESSIONS"):
+        Settings(_env_file=None, ENVIRONMENT="production", DEV_MODE=False, SECRET_KEY="x" * 48,
+                 SECRET_PROVIDER="openbao", OPENBAO_ADDR="https://bao:8200", OPENBAO_TOKEN="t",
+                 SSH_ALLOW_UNRECORDED_SESSIONS=True)

@@ -5,6 +5,7 @@ Security & transport component tests for Member 10 (Phase 10.2 Stage 1):
 - AsyncSSHTerminalGateway credential handling, lifecycle cleanup, and wiped credential refusal.
 """
 
+import hashlib
 import os
 import uuid
 from datetime import datetime, timezone
@@ -102,7 +103,9 @@ async def test_ticket_issuance_and_atomic_consumption(redis_client):
     assert isinstance(ticket, str) and len(ticket) >= 32
 
     # Check key exists and has TTL
-    ttl = await redis_client.ttl(f"ssh:ticket:{ticket}")
+    key = f"ssh:ticket:{hashlib.sha256(ticket.encode()).hexdigest()}"
+    assert await redis_client.exists(f"ssh:ticket:{ticket}") == 0  # raw ticket is never a key
+    ttl = await redis_client.ttl(key)
     assert 0 < ttl <= 60
 
     # First consumption: succeeds
@@ -274,27 +277,17 @@ async def test_unknown_host_key_fails_closed():
 
 
 @pytest.mark.asyncio
-async def test_redis_backed_host_key_resolution(redis_client):
-    trusted_key = asyncssh.generate_private_key("ssh-ed25519")
-    pub_entry = trusted_key.export_public_key().decode().strip()
+async def test_host_key_planted_in_redis_is_not_trusted(redis_client):
+    """Redis is not a trust source: a key written there must not let a host in."""
+    planted = asyncssh.generate_private_key("ssh-ed25519")
+    pub_entry = planted.export_public_key().decode().strip()
     asset = _sample_asset()
-
-    # Admin pre-provisions key in Redis
-    redis_key = f"ssh:known_hosts:{asset.id}"
-    known_hosts_line = f"{asset.hostname},{asset.ip_address} {pub_entry}\n"
-    await redis_client.set(redis_key, known_hosts_line)
-
-    validator = SSHHostKeyValidator(redis_client=redis_client)
-    kh = await validator.get_trusted_known_hosts_for_asset(asset)
-    assert kh is not None
-
-    assert validator.verify_server_key(
-        kh,
-        asset.hostname,
-        asset.ip_address,
-        asset.port,
-        trusted_key,
-    ) is True
+    await redis_client.set(f"ssh:known_hosts:{asset.id}", f"{asset.hostname},{asset.ip_address} {pub_entry}\n")
+    try:
+        with pytest.raises(SSHHostKeyUnknownError):
+            await SSHHostKeyValidator().get_trusted_known_hosts_for_asset(asset)
+    finally:
+        await redis_client.delete(f"ssh:known_hosts:{asset.id}")
 
 
 # --- 3. AsyncSSHTerminalGateway Transport Tests ------------------------------

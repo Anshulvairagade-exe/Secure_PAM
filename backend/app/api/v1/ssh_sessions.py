@@ -81,6 +81,12 @@ class CreateSSHSessionRequest(BaseModel):
     asset_id: uuid.UUID
 
 
+def _recording_unavailable(asset: Asset, access_request: AccessRequest) -> bool:
+    """Recording is required but terminal capture does not exist yet."""
+    required = asset.recording_required or access_request.recording_required
+    return required and not settings.SSH_ALLOW_UNRECORDED_SESSIONS
+
+
 async def _fail_launch(
     db: AsyncSession,
     *,
@@ -173,6 +179,11 @@ async def launch_ssh_session(
         await deny("ASSET_DISABLED", "This target is not available.")
     if access_request.status != "ACTIVE":
         await deny("ACCESS_REQUEST_NOT_ACTIVE", "This access request is not active.")
+    if _recording_unavailable(asset, access_request):
+        await deny(
+            "RECORDING_UNAVAILABLE",
+            "This target requires session recording, which the SSH gateway does not support yet.",
+        )
 
     grant = await _jit.validate(db, user_id=current_user.id, target_id=asset.id, protocol="SSH")
     if grant is None or grant.request_id != access_request.id:
@@ -553,6 +564,12 @@ async def ssh_terminal_websocket(
             await websocket.close(code=status.WS_1008_POLICY_VIOLATION, reason="Access request is not active")
             return
 
+        if _recording_unavailable(asset, access_request):
+            await websocket.close(
+                code=status.WS_1008_POLICY_VIOLATION, reason="Session recording is required but not available"
+            )
+            return
+
         # Revalidate JIT grant before establishing live SSH connection
         grant = await _jit.validate(db, user_id=user.id, target_id=asset.id, protocol="SSH")
         if grant is None or grant.id != session.jit_grant_id:
@@ -727,6 +744,21 @@ async def ssh_terminal_websocket(
                     # Periodic database revalidation of JIT grant, request, user, and asset
                     try:
                         async with async_session_factory() as poll_db:
+                            # The session row itself: an admin or owner terminating it
+                            # (POST /sessions/{id}/terminate, on any worker) ends the terminal.
+                            s = await poll_db.get(Session, session_id)
+                            if s is None or s.status not in ("STARTING", "ACTIVE"):
+                                logger.info("Session %s ended in the database; closing terminal", session_id)
+                                final_status = "COMPLETED"
+                                final_reason = "SESSION_TERMINATED"
+                                try:
+                                    await websocket.send_text(
+                                        json.dumps({"type": "error", "message": "Session was terminated. Closing."})
+                                    )
+                                except Exception:
+                                    pass
+                                break
+
                             g = await poll_db.get(JITGrant, session_jit_grant_id)
                             ar = await poll_db.get(AccessRequest, session_request_id)
                             u = await poll_db.get(User, session_user_id)

@@ -16,6 +16,7 @@ Security Controls:
 """
 
 import asyncio
+import hashlib
 import json
 import secrets
 import uuid
@@ -92,7 +93,9 @@ class SSHTicketService:
             self._loop = None
 
     def _ticket_key(self, ticket: str) -> str:
-        return f"{self.KEY_PREFIX}{ticket}"
+        # Keyed by SHA-256 of the ticket, never the ticket itself, so reading
+        # Redis (e.g. SCAN ssh:ticket:*) does not reveal a usable ticket.
+        return f"{self.KEY_PREFIX}{hashlib.sha256(ticket.encode('utf-8')).hexdigest()}"
 
     async def issue_ticket(
         self,

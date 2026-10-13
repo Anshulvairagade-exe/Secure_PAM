@@ -119,6 +119,13 @@ class Settings(BaseSettings):
     JIT_DEFAULT_DURATION: int = 30  # minutes
     JIT_MAX_DURATION: int = 480  # minutes
 
+    # --- SSH gateway ---
+    # Terminal recording is not captured yet. While this is false (the
+    # default), SSH sessions for targets or requests that require recording
+    # are refused. true lets them run unrecorded, with the recording marked
+    # FAILED; development and lab only, refused in production.
+    SSH_ALLOW_UNRECORDED_SESSIONS: bool = False
+
     # --- Risk Engine (project-specific scoring choices) ---
     # Defaults equal app.risk.engine.RISK_WEIGHTS; RiskConfiguration validates
     # them at startup (unknown factors, negative weights or misordered
@@ -249,6 +256,9 @@ class Settings(BaseSettings):
                 errors.append("OPENBAO_SECRET_PATH_PREFIX is invalid")
             if self.OPENBAO_CONNECT_TIMEOUT_SECONDS <= 0 or self.OPENBAO_REQUEST_TIMEOUT_SECONDS <= 0:
                 errors.append("OPENBAO_*_TIMEOUT_SECONDS must be positive")
+
+        if production and self.SSH_ALLOW_UNRECORDED_SESSIONS:
+            errors.append("SSH_ALLOW_UNRECORDED_SESSIONS=true is not allowed when ENVIRONMENT=production")
 
         if errors:
             raise SettingsError("; ".join(errors))
