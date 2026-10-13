@@ -38,6 +38,9 @@ python-dotenv==1.2.4
 orjson==3.13.0
 tenacity==9.0.0
 
+# --- SSH Gateway ---
+asyncssh==2.24.1
+
 # --- Testing ---
 pytest==9.1.1
 pytest-asyncio==1.4.0
