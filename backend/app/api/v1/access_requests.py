@@ -12,6 +12,7 @@ cancel on someone else's request returns 404 (not 403), so a non-owner
 can't even confirm the request exists. See _get_visible_request_or_404.
 """
 
+from datetime import datetime, timezone
 from typing import Optional
 from uuid import UUID
 
@@ -23,8 +24,14 @@ from app.core.audit import client_ip, write_audit_log
 from app.core.deps import get_current_active_user, get_db
 from app.core.pagination import apply_sorting, paginate
 from app.models.access_request import AccessRequest
+from app.models.jit_grant import JITGrant
 from app.models.user import User
-from app.schemas.access_requests import AccessRequestCreate, AccessRequestOut
+from app.schemas.access_requests import (
+    AccessRequestCreate,
+    AccessRequestDetailOut,
+    AccessRequestOut,
+    JITGrantSummary,
+)
 from app.schemas.common import PaginatedResponse, PaginationParams
 from app.services.access_decision import (
     AccessDecisionService,
@@ -128,7 +135,7 @@ async def list_access_requests(
     return await paginate(db, query, pagination, schema=AccessRequestOut)
 
 
-@router.get("/{request_id}", response_model=AccessRequestOut)
+@router.get("/{request_id}", response_model=AccessRequestDetailOut)
 async def get_access_request(
     request_id: UUID,
     db: AsyncSession = Depends(get_db),
@@ -136,7 +143,23 @@ async def get_access_request(
 ):
     if not _can_view_all(current_user) and not _can_view_own(current_user):
         raise HTTPException(status.HTTP_403_FORBIDDEN, "You are not authorized to view access requests.")
-    return await _get_visible_request_or_404(db, request_id, current_user)
+    access_request = await _get_visible_request_or_404(db, request_id, current_user)
+
+    grant = (
+        await db.execute(
+            select(JITGrant)
+            .where(JITGrant.request_id == access_request.id)
+            .order_by(JITGrant.granted_at.desc())
+        )
+    ).scalars().first()
+    detail = AccessRequestDetailOut.model_validate(access_request)
+    if grant is not None:
+        summary = JITGrantSummary.model_validate(grant)
+        # Read-only view: report a lapsed grant as EXPIRED without writing.
+        if summary.status == "ACTIVE" and summary.expires_at <= datetime.now(timezone.utc):
+            summary.status = "EXPIRED"
+        detail.jit_grant = summary
+    return detail
 
 
 @router.post("/{request_id}/cancel", response_model=AccessRequestOut)

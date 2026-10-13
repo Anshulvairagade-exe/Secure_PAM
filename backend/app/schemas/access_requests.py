@@ -64,3 +64,20 @@ class AccessRequestOut(BaseModel):
     expires_at: Optional[datetime] = None
     decided_at: Optional[datetime] = None
     decided_by: Optional[UUID] = None
+
+
+class JITGrantSummary(BaseModel):
+    """The JIT grant issued for a request. `status` is EXPIRED once
+    `expires_at` has passed, even before the stored row is flipped."""
+    model_config = ConfigDict(from_attributes=True)
+
+    id: UUID
+    protocol: str
+    status: str
+    granted_at: datetime
+    expires_at: datetime
+    revoked_at: Optional[datetime] = None
+
+
+class AccessRequestDetailOut(AccessRequestOut):
+    jit_grant: Optional[JITGrantSummary] = None

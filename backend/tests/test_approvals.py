@@ -258,3 +258,30 @@ async def test_expired_request_cannot_be_rejected(
 
     await db_session.refresh(request)
     assert request.status == "APPROVAL_REQUIRED"
+
+
+async def test_request_detail_shows_its_jit_grant(client: AsyncClient, admin_token: str, operator_token: str, approver_token: str, db_session: AsyncSession):
+    request_id, approval_id = await _create_approval_required_request(client, admin_token, operator_token, db_session)
+
+    before = await client.get(f"/api/v1/access-requests/{request_id}", headers=auth_header(operator_token))
+    assert before.json()["jit_grant"] is None
+
+    await client.post(f"/api/v1/approvals/{approval_id}/approve", json={}, headers=auth_header(approver_token))
+    body = (await client.get(f"/api/v1/access-requests/{request_id}", headers=auth_header(operator_token))).json()
+    grant = body["jit_grant"]
+    assert grant["status"] == "ACTIVE" and grant["protocol"] == "SSH"
+    row = (await db_session.execute(select(JITGrant).where(JITGrant.id == grant["id"]))).scalar_one()
+    assert str(row.request_id) == request_id  # bound to this request
+
+
+async def test_request_detail_reports_lapsed_grant_as_expired_without_writing(client: AsyncClient, admin_token: str, operator_token: str, approver_token: str, db_session: AsyncSession):
+    request_id, approval_id = await _create_approval_required_request(client, admin_token, operator_token, db_session)
+    await client.post(f"/api/v1/approvals/{approval_id}/approve", json={}, headers=auth_header(approver_token))
+    row = (await db_session.execute(select(JITGrant).where(JITGrant.request_id == request_id))).scalar_one()
+    row.expires_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+    await db_session.commit()
+
+    body = (await client.get(f"/api/v1/access-requests/{request_id}", headers=auth_header(operator_token))).json()
+    assert body["jit_grant"]["status"] == "EXPIRED"
+    await db_session.refresh(row)
+    assert row.status == "ACTIVE"  # GET did not modify the stored grant

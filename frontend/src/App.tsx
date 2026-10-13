@@ -11,6 +11,8 @@ import AccessRequests from '@/pages/AccessRequests';
 import AccessRequestNew from '@/pages/AccessRequestNew';
 import AccessRequestDetail from '@/pages/AccessRequestDetail';
 import ApprovalsPage from '@/pages/Approvals';
+import AuditLogs from '@/pages/AuditLogs';
+import VaultReferences from '@/pages/VaultReferences';
 import ComingSoon from '@/pages/ComingSoon';
 import NotFound from '@/pages/NotFound';
 
@@ -53,7 +55,7 @@ export default function App() {
           path="/audit"
           element={
             <ProtectedRoute requiredRoles={['ADMIN', 'AUDITOR']}>
-              <ComingSoon title="Audit Logs" phase="Phase 15" />
+              <AuditLogs />
             </ProtectedRoute>
           }
         />
@@ -77,7 +79,7 @@ export default function App() {
           path="/vault"
           element={
             <ProtectedRoute requiredRoles={['ADMIN']}>
-              <ComingSoon title="Vault References" phase="Phase 7" />
+              <VaultReferences />
             </ProtectedRoute>
           }
         />

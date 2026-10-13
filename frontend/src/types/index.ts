@@ -156,6 +156,42 @@ export interface AccessRequest {
   expires_at?: string;
   decided_at?: string;
   decided_by?: string;
+  /** Only on GET /access-requests/{id}: the JIT grant issued for this request. */
+  jit_grant?: JITGrantSummary | null;
+}
+
+export type SecretType = 'PASSWORD' | 'SSH_KEY' | 'API_KEY' | 'CERTIFICATE';
+
+/** A pointer to a secret in the provider. Never carries the secret itself. */
+export interface CredentialRef {
+  id: string;
+  asset_id: string;
+  provider: string;
+  vault_path: string;
+  secret_type: SecretType;
+  username?: string | null;
+  secret_version?: number | null;
+  is_active: boolean;
+  last_rotated?: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface CredentialRefInput {
+  secret_name: string;
+  secret_type: SecretType;
+  username?: string;
+  secret_version?: number;
+}
+
+export interface JITGrantSummary {
+  id: string;
+  protocol: string;
+  /** ACTIVE, EXPIRED or REVOKED; EXPIRED as soon as expires_at has passed. */
+  status: string;
+  granted_at: string;
+  expires_at: string;
+  revoked_at?: string | null;
 }
 
 export interface AccessRequestInput {

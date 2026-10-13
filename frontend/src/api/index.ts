@@ -12,6 +12,8 @@ import type {
   DashboardActivity,
   Asset,
   AssetInput,
+  CredentialRef,
+  CredentialRefInput,
   Application,
   ApplicationInput,
   Policy,
@@ -144,12 +146,32 @@ export const approvalsApi = {
     apiClient.post<Approval>(`/approvals/${id}/reject`, { comment }).then(r => r.data),
 };
 
+// --- Credential references (pointers into OpenBao; no secret values) ---
+
+export const credentialRefsApi = {
+  /** Resolves to null when the asset has no active reference (404). */
+  get: (assetId: string) =>
+    apiClient
+      .get<CredentialRef>(`/assets/${assetId}/credential-ref`)
+      .then(r => r.data)
+      .catch((error) => {
+        if (error?.response?.status === 404) return null;
+        throw error;
+      }),
+
+  set: (assetId: string, data: CredentialRefInput) =>
+    apiClient.put<CredentialRef>(`/assets/${assetId}/credential-ref`, data).then(r => r.data),
+
+  deactivate: (assetId: string) =>
+    apiClient.delete(`/assets/${assetId}/credential-ref`).then(() => undefined),
+};
+
 // --- Audit ---
 
 export const auditApi = {
   list: (params?: ListParams) =>
     apiClient
-      .get<PaginatedResponse<AuditLog>>('/audit', { params })
+      .get<PaginatedResponse<AuditLog>>('/audit/', { params })
       .then(r => r.data),
 };
 
