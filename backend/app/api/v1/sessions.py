@@ -231,8 +231,11 @@ async def launch_rdp_session(
     if access_request.status != "ACTIVE":
         await deny("ACCESS_REQUEST_NOT_ACTIVE", "This access request is not active.")
 
-    grant = await _jit.validate(db, user_id=current_user.id, target_id=asset.id, protocol="RDP")
-    if grant is None or grant.request_id != access_request.id:
+    # The grant issued for THIS request (not merely the user's newest grant).
+    grant = await _jit.grant_for_request(
+        db, request_id=access_request.id, user_id=current_user.id, target_id=asset.id, protocol="RDP"
+    )
+    if grant is None:
         await deny("NO_VALID_JIT_GRANT", "No valid just-in-time grant for this request.")
 
     session = Session(

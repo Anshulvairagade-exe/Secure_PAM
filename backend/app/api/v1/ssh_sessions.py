@@ -238,8 +238,11 @@ async def launch_ssh_session(
             "This target requires session recording, but recording storage is unavailable.",
         )
 
-    grant = await _jit.validate(db, user_id=current_user.id, target_id=asset.id, protocol="SSH")
-    if grant is None or grant.request_id != access_request.id:
+    # The grant issued for THIS request (not merely the user's newest grant).
+    grant = await _jit.grant_for_request(
+        db, request_id=access_request.id, user_id=current_user.id, target_id=asset.id, protocol="SSH"
+    )
+    if grant is None:
         await deny("NO_VALID_JIT_GRANT", "No valid just-in-time grant for this request.")
 
     session = Session(
@@ -616,8 +619,12 @@ async def ssh_terminal_websocket(
             return
 
         # Revalidate JIT grant before establishing live SSH connection
-        grant = await _jit.validate(db, user_id=user.id, target_id=asset.id, protocol="SSH")
-        if grant is None or grant.id != session.jit_grant_id:
+        # The grant this session was opened with must still be live.
+        grant = await _jit.live_grant(
+            db, await db.get(JITGrant, session.jit_grant_id) if session.jit_grant_id else None,
+            user_id=user.id, target_id=asset.id, protocol="SSH",
+        )
+        if grant is None:
             await websocket.close(code=status.WS_1008_POLICY_VIOLATION, reason="JIT grant is expired or invalid")
             return
 

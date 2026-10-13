@@ -179,3 +179,29 @@ async def test_reference_check_requires_vault_manage(client: AsyncClient, operat
     asset_id = await _asset_with_ref(client, admin_token, db_session)
     r = await client.post(f"/api/v1/assets/{asset_id}/credential-ref/check", headers=auth_header(operator_token))
     assert r.status_code == 403
+
+
+# --- grant binding with several live grants for one target ---------------------
+
+async def test_each_request_uses_its_own_grant(client: AsyncClient, db_session, operator_token):
+    """Two approved requests for the same target: the older one is still
+    launchable, and revoking its grant denies it even though the newer
+    grant remains active."""
+    from app.models.jit_grant import JITGrant
+
+    _use_provider(MockSecretProvider({SSH_PATH: {"username": "ubuntu", "password": CANARY}}))
+    older = await _ssh_ready(db_session)
+    newer = await _ssh_ready(db_session, with_ref=False)  # one reference per target
+    assert older.asset_id == newer.asset_id and older.jit_grant_id != newer.jit_grant_id
+
+    r = await _launch(client, operator_token, older)
+    assert r.status_code == 201, r.text
+    s = await db_session.get(Session, uuid.UUID(r.json()["session_id"]))
+    assert s.jit_grant_id == older.jit_grant_id
+
+    grant = await db_session.get(JITGrant, older.jit_grant_id)
+    grant.status = "REVOKED"
+    await db_session.commit()
+    denied = await _launch(client, operator_token, older)
+    assert denied.status_code == 403
+    assert (await _launch(client, operator_token, newer)).status_code == 201

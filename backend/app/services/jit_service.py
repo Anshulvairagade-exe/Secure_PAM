@@ -147,6 +147,40 @@ class JITService:
 
         return grant
 
+    async def live_grant(
+        self, db: AsyncSession, grant: Optional[JITGrant], *, user_id: UUID, target_id: UUID, protocol: str
+    ) -> Optional[JITGrant]:
+        """`grant` if it is live and belongs to this user, target and
+        protocol, else None. Unlike validate() this checks one specific grant,
+        so a user holding several grants for the same target can use each of
+        them for its own request or session. A lapsed ACTIVE grant is flipped
+        to EXPIRED, as in validate()."""
+        if (
+            grant is None
+            or grant.user_id != user_id
+            or target_id not in (grant.asset_id, grant.application_id)
+            or grant.protocol != protocol
+            or grant.status != "ACTIVE"
+        ):
+            return None
+        if grant.expires_at <= datetime.now(timezone.utc):
+            grant.status = "EXPIRED"
+            await self._end_bound_sessions(db, grant, "JIT_EXPIRED")
+            await db.flush()
+            return None
+        return grant
+
+    async def grant_for_request(
+        self, db: AsyncSession, *, request_id: UUID, user_id: UUID, target_id: UUID, protocol: str
+    ) -> Optional[JITGrant]:
+        """The live grant issued for this access request, or None."""
+        result = await db.execute(
+            select(JITGrant).where(JITGrant.request_id == request_id).order_by(JITGrant.granted_at.desc())
+        )
+        return await self.live_grant(
+            db, result.scalars().first(), user_id=user_id, target_id=target_id, protocol=protocol
+        )
+
     async def revoke(self, db: AsyncSession, grant: JITGrant) -> JITGrant:
         if grant.status == "ACTIVE":
             grant.status = "REVOKED"
