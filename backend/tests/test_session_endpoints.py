@@ -514,7 +514,8 @@ async def test_launch_rejects_client_supplied_identity(client, db_session, opera
 async def test_launch_without_credential_reference_fails_closed(client, db_session, operator_token, provider):
     req = await _rdp_ready(db_session, with_ref=False)
     r = await client.post("/api/v1/sessions/rdp/launch", headers=auth_header(operator_token), json=_launch_body(req))
-    assert r.status_code == 403
+    assert r.status_code == 409  # missing reference is a configuration error, not an authorization failure
+    assert "No credential is configured" in r.json()["detail"]
     (s,) = (await db_session.execute(select(Session))).scalars().all()
     assert s.status == "FAILED"
     (failed,) = await _actions(db_session, "SESSION_LAUNCH_FAILED")

@@ -445,11 +445,16 @@ async def test_websocket_host_key_mismatch_fails_closed(db_session, operator_tok
         session_id = data["session_id"]
         ticket = data["ticket"]
 
-        # WebSocket connection must fail due to host key mismatch
-        with pytest.raises(Exception):
-            with client.websocket_connect(f"/api/v1/sessions/ssh/{session_id}/ws") as ws:
-                ws.send_text(json.dumps({"type": "auth", "ticket": ticket}))
-                ws.receive_text()
+        # WebSocket connection must fail closed on host key mismatch: the
+        # server first sends a safe error frame, then closes with the stable
+        # reason code (see credential_errors.failure_message).
+        with client.websocket_connect(f"/api/v1/sessions/ssh/{session_id}/ws") as ws:
+            ws.send_text(json.dumps({"type": "auth", "ticket": ticket}))
+            frame = json.loads(ws.receive_text())
+            assert frame["type"] == "error"
+            assert "host key" in frame["message"].lower()
+            with pytest.raises(Exception):
+                ws.receive_text()  # server has closed the connection
 
         # Session must be recorded as FAILED in DB
         s = await db_session.get(Session, uuid.UUID(session_id))

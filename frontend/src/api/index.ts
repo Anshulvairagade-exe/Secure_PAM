@@ -13,6 +13,7 @@ import type {
   Asset,
   AssetInput,
   CredentialRef,
+  CredentialRefCheck,
   CredentialRefInput,
   Recording,
   Session,
@@ -168,6 +169,10 @@ export const credentialRefsApi = {
 
   deactivate: (assetId: string) =>
     apiClient.delete(`/assets/${assetId}/credential-ref`).then(() => undefined),
+
+  /** Admin-only readability probe. Returns safe status/reason only — never the secret. */
+  check: (assetId: string) =>
+    apiClient.post<CredentialRefCheck>(`/assets/${assetId}/credential-ref/check`).then(r => r.data),
 };
 
 // --- Audit ---

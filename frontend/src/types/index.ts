@@ -184,6 +184,21 @@ export interface CredentialRefInput {
   secret_version?: number;
 }
 
+/** Result of POST /assets/{id}/credential-ref/check. Safe status + reason
+ *  only — never carries the secret value. */
+export type CredentialRefCheckStatus =
+  | 'ok'
+  | 'secret_not_found'
+  | 'access_denied'
+  | 'unavailable'
+  | 'malformed'
+  | 'no_reference';
+
+export interface CredentialRefCheck {
+  status: CredentialRefCheckStatus;
+  message: string;
+}
+
 export interface JITGrantSummary {
   id: string;
   protocol: string;

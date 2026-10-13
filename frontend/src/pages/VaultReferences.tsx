@@ -5,9 +5,20 @@ import { assetsApi, credentialRefsApi } from '@/api';
 import { getApiErrorMessage } from '@/api/errors';
 import { ErrorBanner, EmptyState, Skeleton } from '@/components/Feedback';
 import { useAuth } from '@/hooks/useAuth';
-import type { Asset, SecretType } from '@/types';
+import type { Asset, CredentialRefCheckStatus, SecretType } from '@/types';
 
 const SECRET_TYPES: SecretType[] = ['PASSWORD', 'SSH_KEY', 'API_KEY', 'CERTIFICATE'];
+
+/** Safe, user-facing label for each check status. The detail message comes
+ *  from the backend; only status/reason is ever rendered — never a secret. */
+const CHECK_LABELS: Record<CredentialRefCheckStatus, { label: string; className: string }> = {
+  ok: { label: 'Readable', className: 'badge-success' },
+  secret_not_found: { label: 'Secret missing', className: 'badge-warning' },
+  access_denied: { label: 'Permission denied', className: 'badge-danger' },
+  unavailable: { label: 'Provider unavailable', className: 'badge-danger' },
+  malformed: { label: 'Malformed secret', className: 'badge-warning' },
+  no_reference: { label: 'No reference', className: 'badge-neutral' },
+};
 
 export default function VaultReferences() {
   const { hasPermission } = useAuth();
@@ -74,6 +85,9 @@ function AssetReferenceRow({ asset, canManage }: { asset: Asset; canManage: bool
     mutationFn: () => credentialRefsApi.deactivate(asset.id),
     onSuccess: () => void invalidate(),
   });
+  const check = useMutation({
+    mutationFn: () => credentialRefsApi.check(asset.id),
+  });
 
   return (
     <div className="space-y-3 p-4">
@@ -98,6 +112,15 @@ function AssetReferenceRow({ asset, canManage }: { asset: Asset; canManage: bool
           {canManage && !editing && (
             <button className="btn-secondary px-2 py-1 text-xs" onClick={() => setEditing(true)}>
               {ref.data ? 'Change' : 'Set'}
+            </button>
+          )}
+          {canManage && ref.data && !editing && (
+            <button
+              className="btn-secondary px-2 py-1 text-xs"
+              disabled={check.isPending}
+              onClick={() => check.mutate()}
+            >
+              {check.isPending ? 'Checking…' : 'Check'}
             </button>
           )}
           {canManage && ref.data && !editing && (
@@ -143,6 +166,18 @@ function AssetReferenceRow({ asset, canManage }: { asset: Asset; canManage: bool
 
       {(save.isError || deactivate.isError || ref.isError) && (
         <ErrorBanner message={getApiErrorMessage(save.error ?? deactivate.error ?? ref.error, 'Credential reference update failed.')} />
+      )}
+
+      {check.data && (
+        <p className="flex flex-wrap items-center gap-2 text-xs" role="status">
+          <span className={CHECK_LABELS[check.data.status].className}>
+            {CHECK_LABELS[check.data.status].label}
+          </span>
+          <span className="text-gray-400">{check.data.message}</span>
+        </p>
+      )}
+      {check.isError && (
+        <ErrorBanner message={getApiErrorMessage(check.error, 'Credential reference check failed.')} />
       )}
     </div>
   );
