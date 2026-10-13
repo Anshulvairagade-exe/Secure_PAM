@@ -3,6 +3,10 @@
 - The evaluation endpoint takes NO request body: the client cannot supply role, risk, MFA,
   target registration, approval, JIT or expiry. `context_provider` (backend code) builds the
   AccessContext from trusted sources.
+- Every route requires authentication: `auth_dependency` (the backend's auth dependency,
+  returning the authenticated actor) is mandatory, and the router cannot be built without it.
+  The actor is passed to `context_provider(request_id, request, actor)`, which must refuse
+  (raise HTTPException 403/404) when that actor may not evaluate that access request.
 - Admin routes are mounted only if BOTH a policy repository with publish/disable and an
   `admin_dependency` (returning the authenticated admin's id) are supplied.
 """
@@ -60,15 +64,20 @@ class PolicySchema(BaseModel):
 
 
 def create_policy_router(evaluator: PolicyEvaluator,
-                         context_provider: Callable[[str, Request], AccessContext],
+                         context_provider: Callable[[str, Request, object], AccessContext],
                          audit_sink: Optional[Callable[[dict], None]] = None,
                          repository=None,
-                         admin_dependency: Optional[Callable] = None) -> APIRouter:
+                         admin_dependency: Optional[Callable] = None,
+                         *,
+                         auth_dependency: Callable) -> APIRouter:
+    if auth_dependency is None:
+        raise ValueError("auth_dependency is required: the evaluation route must not be unauthenticated")
     router = APIRouter(tags=["policy-engine"])
 
     @router.post("/access-requests/{request_id}/policy-evaluation")
-    def evaluate(request_id: str, request: Request):
-        context = context_provider(request_id, request)  # trusted, server-side; may raise HTTPException
+    def evaluate(request_id: str, request: Request, actor=Depends(auth_dependency)):
+        # Trusted, server-side; must check that `actor` may evaluate this request (IDOR).
+        context = context_provider(request_id, request, actor)
         decision = evaluator.evaluate(context)
         if audit_sink is not None:  # every decision, including DENY, is audited
             audit_sink({"event": "policy.evaluated", "user_id": context.user_id,

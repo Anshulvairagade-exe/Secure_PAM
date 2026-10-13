@@ -2,7 +2,7 @@ import pytest
 pytest.importorskip("fastapi")
 pytest.importorskip("httpx")
 from datetime import datetime, timezone
-from fastapi import Depends, FastAPI
+from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
@@ -13,7 +13,16 @@ from securepam_policy_engine.default_policies import DEFAULT_POLICIES
 from securepam_policy_engine.repository import InMemoryPolicyRepository
 
 
-def provider(request_id, request):
+def authenticated(authorization: str = Header(None)):
+    """Stand-in for the backend's auth dependency."""
+    if authorization not in ("Bearer u1", "Bearer u2"):
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    return authorization.removeprefix("Bearer ")
+
+
+def provider(request_id, request, actor):
+    if actor != "u1":  # REQ-* belong to u1 in this fixture
+        raise HTTPException(status_code=404, detail="Access request not found")
     return AccessContext(request_id=request_id, user_id="u1", role="Operator", target_id="srv-1",
                          target_registered=True, environment="staging", protocol="SSH",
                          requested_duration_minutes=20, mfa_satisfied=True, risk_score=10,
@@ -31,8 +40,9 @@ def build(admin=False):
     audit.clear()
     app = FastAPI()
     kw = dict(repository=repo, admin_dependency=lambda: "admin-1") if admin else {}
-    app.include_router(create_policy_router(PolicyEvaluator(repo), provider, audit_sink=audit.append, **kw))
-    return TestClient(app), audit
+    app.include_router(create_policy_router(PolicyEvaluator(repo), provider, audit_sink=audit.append,
+                                            auth_dependency=authenticated, **kw))
+    return TestClient(app, headers={"Authorization": "Bearer u1"}), audit
 
 
 def test_evaluation_endpoint_returns_decision_and_audits():
@@ -74,3 +84,22 @@ def test_admin_rejects_unsafe_or_unknown_input():
     wildcard = {"policy_id": "POL-901", "name": "oops"}  # ALLOW with empty selectors
     assert client.post("/policies", json=wildcard).status_code == 422
     assert client.post("/policies", json={**wildcard, "version": 50, "allowed_roles": ["x"]}).status_code == 422
+
+
+def test_router_cannot_be_built_without_authentication():
+    with pytest.raises(TypeError):
+        create_policy_router(PolicyEvaluator(InMemoryPolicyRepository([])), provider)
+    with pytest.raises(ValueError):
+        create_policy_router(PolicyEvaluator(InMemoryPolicyRepository([])), provider, auth_dependency=None)
+
+
+def test_evaluation_requires_authentication():
+    client, audit = build()
+    r = client.post("/access-requests/REQ-7/policy-evaluation", headers={"Authorization": ""})
+    assert r.status_code == 401 and audit == []
+
+
+def test_evaluation_of_another_users_request_is_refused():
+    client, audit = build()
+    r = client.post("/access-requests/REQ-7/policy-evaluation", headers={"Authorization": "Bearer u2"})
+    assert r.status_code == 404 and audit == []

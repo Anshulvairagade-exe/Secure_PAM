@@ -52,11 +52,12 @@ print(decision.decision, decision.can_proceed, decision.reason_codes)
 ```
 
 ## Production wiring
-1. Create the table: `migrations/001_create_policies.sql` (PostgreSQL) or `Base.metadata.create_all(engine)`.
+1. Create the table: `migrations/001_create_policy_engine_policies.sql` (PostgreSQL) or `Base.metadata.create_all(engine)`.
 2. `repo = SqlAlchemyPolicyRepository(session_factory, audit_sink=audit_service.write)` — versioned, append-only; the
    audit sink runs before commit so a failed audit write rolls the policy change back.
-3. `app.include_router(create_policy_router(PolicyEvaluator(repo), context_provider, audit_sink, repo, admin_dependency))`.
-   `context_provider` is *your* backend code building `AccessContext` from trusted sources. The evaluation endpoint reads **no**
+3. `app.include_router(create_policy_router(PolicyEvaluator(repo), context_provider, audit_sink, repo, admin_dependency, auth_dependency=get_current_active_user))`.
+   `auth_dependency` is required and protects every route. `context_provider(request_id, request, actor)` is *your* backend
+   code building `AccessContext` from trusted sources; it must refuse when `actor` may not evaluate that request. The evaluation endpoint reads **no**
    request body. Admin routes mount only if you pass both a repository and an `admin_dependency` (RBAC check returning the actor id).
 4. Seed baseline policies for review: `python tools/export_policies.py` regenerates `policies.json` from `default_policies.py`.
 

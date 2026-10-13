@@ -63,3 +63,14 @@ def test_evaluator_works_against_db_policies(repo_and_audit, context):
         repo.publish(p, actor="seed")
     d = PolicyEvaluator(repo).evaluate(context)
     assert d.decision is Decision.ALLOW and {m["version"] for m in d.matched_policies} == {1}
+
+
+def test_table_does_not_collide_with_backend_policies_table():
+    # The backend's Alembic schema owns "policies"; the SQL migration and the
+    # ORM must agree on the engine's own name.
+    from pathlib import Path
+    from securepam_policy_engine.db import PolicyRow
+    assert PolicyRow.__tablename__ == "policy_engine_policies"
+    sql = (Path(__file__).resolve().parents[1] / "migrations/001_create_policy_engine_policies.sql").read_text()
+    assert "CREATE TABLE IF NOT EXISTS policy_engine_policies (" in sql
+    assert " policies " not in sql and " policies(" not in sql

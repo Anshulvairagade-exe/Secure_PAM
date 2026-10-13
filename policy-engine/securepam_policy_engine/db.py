@@ -21,8 +21,9 @@ class Base(DeclarativeBase):
 
 class PolicyRow(Base):
     """One row per policy VERSION. Rows are never updated except `is_current`."""
-    __tablename__ = "policies"
-    __table_args__ = (UniqueConstraint("policy_id", "version", name="uq_policy_version"),)
+    # Not "policies": the backend's Alembic schema already owns that table.
+    __tablename__ = "policy_engine_policies"
+    __table_args__ = (UniqueConstraint("policy_id", "version", name="uq_policy_engine_policy_version"),)
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     policy_id: Mapped[str] = mapped_column(String(64), index=True)
     version: Mapped[int] = mapped_column(Integer)
