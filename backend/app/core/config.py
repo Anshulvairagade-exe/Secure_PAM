@@ -11,6 +11,7 @@ from typing import List, Literal
 from urllib.parse import urlsplit
 
 from pydantic_settings import BaseSettings
+
 from pydantic import SecretStr, field_validator, model_validator
 
 # backend/ — .env is resolved relative to this, not to the process CWD, so
@@ -34,6 +35,7 @@ class SettingsError(Exception):
     ValueErrors in a ValidationError whose message embeds the raw input
     (including OPENBAO_TOKEN); a non-ValueError propagates as-is, carrying
     only the sanitized message built below."""
+
 
 
 class Settings(BaseSettings):
@@ -117,6 +119,36 @@ class Settings(BaseSettings):
     JIT_DEFAULT_DURATION: int = 30  # minutes
     JIT_MAX_DURATION: int = 480  # minutes
 
+    # --- Risk Engine (project-specific scoring choices) ---
+    # Defaults equal app.risk.engine.RISK_WEIGHTS; RiskConfiguration validates
+    # them at startup (unknown factors, negative weights or misordered
+    # thresholds stop the app).
+    RISK_WEIGHT_PRODUCTION_ASSET: int = 30
+    RISK_WEIGHT_CRITICAL_ASSET: int = 25
+    RISK_WEIGHT_HIGH_CRITICALITY: int = 15
+    RISK_WEIGHT_SENSITIVE_APPLICATION: int = 20
+    RISK_WEIGHT_HIGH_PRIVILEGE_ROLE: int = 20
+    RISK_WEIGHT_OUTSIDE_BUSINESS_HOURS: int = 20
+    RISK_WEIGHT_UNKNOWN_CONTEXT: int = 20
+    RISK_WEIGHT_REPEATED_AUTH_FAILURE: int = 20
+    RISK_WEIGHT_UNUSUAL_ACCESS_PATTERN: int = 20
+    RISK_WEIGHT_LONG_DURATION: int = 10
+    RISK_ENABLE_PRODUCTION_ASSET: bool = True
+    RISK_ENABLE_CRITICAL_ASSET: bool = True
+    RISK_ENABLE_HIGH_CRITICALITY: bool = True
+    RISK_ENABLE_SENSITIVE_APPLICATION: bool = True
+    RISK_ENABLE_HIGH_PRIVILEGE_ROLE: bool = True
+    RISK_ENABLE_OUTSIDE_BUSINESS_HOURS: bool = True
+    RISK_ENABLE_UNKNOWN_CONTEXT: bool = True
+    RISK_ENABLE_REPEATED_AUTH_FAILURE: bool = True
+    RISK_ENABLE_UNUSUAL_ACCESS_PATTERN: bool = True
+    RISK_ENABLE_LONG_DURATION: bool = True
+    RISK_HIGH_PRIVILEGE_ROLES: List[str] = ["ADMIN"]
+    RISK_LONG_DURATION_THRESHOLD_MINUTES: int = 60
+    RISK_MEDIUM_THRESHOLD: int = 30
+    RISK_HIGH_THRESHOLD: int = 60
+    RISK_CRITICAL_THRESHOLD: int = 80
+
     # --- Security ---
     TOKEN_EXPIRY_MINUTES: int = 60
     REFRESH_TOKEN_EXPIRY_DAYS: int = 7
@@ -150,6 +182,7 @@ class Settings(BaseSettings):
     def KEYCLOAK_AUTH_URL(self) -> str:
         return f"{self.KEYCLOAK_ISSUER_URL}/protocol/openid-connect/auth"
 
+
     @field_validator("SECRET_PROVIDER", mode="before")
     @classmethod
     def normalize_secret_provider(cls, v):
@@ -159,17 +192,24 @@ class Settings(BaseSettings):
     def validate_security_settings(self) -> "Settings":
         # Messages name the offending setting but never echo a token value.
         errors: List[str] = []
-        production = self.ENVIRONMENT.lower() == "production"
+        environment = self.ENVIRONMENT.strip().lower()
+        production = environment == "production"
+        protected_environment = environment in {"production", "staging"}
 
         # DEV_MODE enables /auth/login, the DevAuth HS256 validator and the
         # seeded admin123/operator123 accounts. Outside local development
         # or the test suite that is an authentication bypass, so refuse it.
         if self.DEV_MODE and self.ENVIRONMENT.lower() not in _DEV_MODE_ENVIRONMENTS:
             errors.append("DEV_MODE=true is only allowed when ENVIRONMENT is development or test")
-        if production and (
-            self.SECRET_KEY == _PLACEHOLDER_SECRET_KEY or len(self.SECRET_KEY) < _MIN_SECRET_KEY_LENGTH
+        if protected_environment and (
+            not self.SECRET_KEY.strip()
+            or self.SECRET_KEY == _PLACEHOLDER_SECRET_KEY
+            or (production and len(self.SECRET_KEY) < _MIN_SECRET_KEY_LENGTH)
         ):
-            errors.append(f"SECRET_KEY must be changed and at least {_MIN_SECRET_KEY_LENGTH} characters when ENVIRONMENT=production")
+            errors.append(
+                "SECRET_KEY must be changed, non-empty, and sufficiently long in production; "
+                "it must be non-empty and non-placeholder in staging"
+            )
 
         if self.SECRET_PROVIDER == "mock":
             if production:
@@ -212,6 +252,7 @@ class Settings(BaseSettings):
 
         if errors:
             raise SettingsError("; ".join(errors))
+
         return self
 
     model_config = {
