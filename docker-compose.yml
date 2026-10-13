@@ -39,7 +39,8 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-securepam_dev_password}
       POSTGRES_DB: ${POSTGRES_DB:-securepam}
     ports:
-      - "5432:5432"
+      # Loopback only: dev credentials are defaults; containers reach it as postgres:5432.
+      - "127.0.0.1:5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
@@ -54,7 +55,8 @@ services:
     image: redis:7-alpine
     container_name: securepam-redis
     ports:
-      - "6379:6379"
+      # Loopback only: Redis has no password and holds rate-limit and ticket state.
+      - "127.0.0.1:6379:6379"
     volumes:
       - redis_data:/data
     healthcheck:
