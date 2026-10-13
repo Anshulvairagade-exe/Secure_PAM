@@ -75,11 +75,23 @@ services:
     environment:
       - DATABASE_URL=postgresql+asyncpg://${POSTGRES_USER:-securepam}:${POSTGRES_PASSWORD:-securepam_dev_password}@postgres:5432/${POSTGRES_DB:-securepam}
       - REDIS_URL=redis://redis:6379/0
+      - OPENBAO_ADDR=http://openbao:8200
     ports:
       - "${BACKEND_PORT:-8000}:8000"
     volumes:
       - ./backend:/app
       - recording_data:/data/recordings
+      - openbao_runtime:/run/openbao:ro
+    command:
+      - sh
+      - -c
+      - |
+        if [ -s /run/openbao/app-token ]; then
+          export OPENBAO_TOKEN="$$(cat /run/openbao/app-token)"
+          export SECRET_PROVIDER=openbao
+          export OPENBAO_ADDR=http://openbao:8200
+        fi
+        alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
     depends_on:
       postgres:
         condition: service_healthy
@@ -169,17 +181,48 @@ services:
     networks:
       - securepam-net
 
-  vault:
-    image: hashicorp/vault:1.15
-    container_name: securepam-vault
+  # In-memory dev server. Do not use this mode in production.
+  # DNS alias "vault" keeps VAULT_URL=http://vault:8200 working.
+  openbao:
+    image: openbao/openbao:2.7.1
+    container_name: securepam-openbao
     profiles: ["lab"]
     environment:
-      VAULT_DEV_ROOT_TOKEN_ID: ${VAULT_TOKEN:-dev-root-token}
-      VAULT_DEV_LISTEN_ADDRESS: 0.0.0.0:8200
+      BAO_ADDR: http://127.0.0.1:8200
+      BAO_DEV_ROOT_TOKEN_ID: ${OPENBAO_DEV_ROOT_TOKEN_ID:-lab-dev-root-token}
+      BAO_DEV_LISTEN_ADDRESS: 0.0.0.0:8200
     cap_add:
       - IPC_LOCK
     ports:
       - "8200:8200"
+    healthcheck:
+      test: ["CMD", "bao", "status", "-address=http://127.0.0.1:8200"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 5s
+    networks:
+      securepam-net:
+        aliases:
+          - vault
+
+  openbao-init:
+    image: openbao/openbao:2.7.1
+    container_name: securepam-openbao-init
+    profiles: ["lab"]
+    environment:
+      BAO_ADDR: http://openbao:8200
+      BAO_TOKEN: ${OPENBAO_DEV_ROOT_TOKEN_ID:-lab-dev-root-token}
+    volumes:
+      - ./infrastructure/openbao/policies:/openbao/policies:ro
+      - ./infrastructure/openbao/init-lab.sh:/openbao/init-lab.sh:ro
+      - openbao_runtime:/openbao/runtime
+    user: "0:0"
+    entrypoint: ["/bin/sh", "/openbao/init-lab.sh"]
+    depends_on:
+      openbao:
+        condition: service_healthy
+    restart: "no"
     networks:
       - securepam-net
 
@@ -220,6 +263,7 @@ volumes:
   recording_data:
   prometheus_data:
   grafana_data:
+  openbao_runtime:
   keycloak_postgres_data:
 
 networks:
