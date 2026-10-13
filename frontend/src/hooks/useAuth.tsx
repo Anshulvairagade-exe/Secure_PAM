@@ -15,6 +15,7 @@ import React, {
   useState,
   useCallback,
 } from 'react';
+import axios from 'axios';
 import type { UserInfo } from '@/types';
 import { authApi } from '@/api';
 import { useKeycloak } from '@/auth/KeycloakProvider';
@@ -73,7 +74,9 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       setUser(userInfo);
     } catch (error) {
       console.error('Unable to load SecurePAM user profile:', error);
-      if (devMode) {
+      // Only an authentication failure ends the dev session; a transient
+      // error (e.g. 429 rate limit, 503) must not sign the user out.
+      if (devMode && axios.isAxiosError(error) && error.response?.status === 401) {
         clearDevToken();
         setHasDevToken(false);
       }
