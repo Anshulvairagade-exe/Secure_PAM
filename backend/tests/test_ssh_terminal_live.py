@@ -12,9 +12,11 @@ Verifies:
 """
 
 import asyncio
+import hashlib
 import json
 import uuid
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import asyncssh
@@ -55,6 +57,13 @@ SSH_PATH = "securepam/assets/linux-dev-01"
 
 
 import threading
+
+
+
+@pytest.fixture(autouse=True)
+def _recording_storage(tmp_path, monkeypatch):
+    """Recordings go to a writable per-test directory (the default /data path is not)."""
+    monkeypatch.setattr(settings, "RECORDING_STORAGE_PATH", str(tmp_path / "recordings"))
 
 
 class ThreadedSSHServer:
@@ -728,9 +737,9 @@ async def test_websocket_db_commit_failure_cleans_up_connection(db_session, oper
 # --- 11. Truthful Recording Status: PENDING during session, FAILED upon completion ---
 
 @pytest.mark.asyncio
-async def test_truthful_recording_status_pending_then_failed(db_session, operator_token, provider, monkeypatch):
-    # Recording required, unrecorded sessions explicitly allowed (lab-only setting).
-    monkeypatch.setattr(settings, "SSH_ALLOW_UNRECORDED_SESSIONS", True)
+async def test_required_recording_captures_real_artifact(db_session, operator_token, provider):
+    """Recording required: the terminal stream is recorded server-side, the
+    artifact is private, hashed and replayable, and the outcome is audited."""
     srv_key = asyncssh.generate_private_key("ssh-ed25519")
     pub_str = srv_key.export_public_key().decode().strip()
     server = ThreadedSSHServer(srv_key)
@@ -746,39 +755,87 @@ async def test_truthful_recording_status_pending_then_failed(db_session, operato
         await db_session.commit()
         client = TestClient(app)
 
-        r = client.post(
+        data = client.post(
             "/api/v1/sessions/ssh/launch",
             headers=auth_header(operator_token),
             json={"request_id": str(sc.access_request_id), "asset_id": str(asset.id)},
-        )
-        data = r.json()
-        session_id = data["session_id"]
-        ticket = data["ticket"]
-        recording_id = data["recording_id"]
-        assert recording_id is not None
+        ).json()
+        session_id, recording_id = data["session_id"], uuid.UUID(data["recording_id"])
 
-        with client.websocket_connect(f"/api/v1/sessions/ssh/{session_id}/ws?ticket={ticket}") as ws:
-            ws.receive_text()  # Read greeting banner
-
-            # While actively connected, verify recording is NOT claimed as RECORDING
+        with client.websocket_connect(f"/api/v1/sessions/ssh/{session_id}/ws?ticket={data['ticket']}") as ws:
+            ws.receive_text()  # greeting
             async with async_session_factory() as db:
-                rec = await db.get(Recording, uuid.UUID(recording_id))
-                assert rec is not None
-                assert rec.status == "PENDING"  # Truthful: capture not active
-
-            # Send exit
+                assert (await db.get(Recording, recording_id)).status == "RECORDING"
+            ws.send_text(json.dumps({"type": "input", "data": "recording-marker\n"}))
+            ws.receive_text()
             ws.send_text(json.dumps({"type": "input", "data": "exit\n"}))
 
-        # After session completion without capture, verify recording is marked FAILED, NEVER COMPLETED
         rec = None
-        for _ in range(25):
+        for _ in range(50):
             async with async_session_factory() as db:
-                rec = await db.get(Recording, uuid.UUID(recording_id))
-            if rec and rec.status == "FAILED":
+                rec = await db.get(Recording, recording_id)
+            if rec and rec.status in ("COMPLETED", "FAILED"):
                 break
             await asyncio.sleep(0.1)
+        assert rec is not None and rec.status == "COMPLETED"
 
-        assert rec is not None and rec.status == "FAILED"
+        artifact = Path(rec.file_path)
+        assert artifact.is_file()
+        assert (artifact.stat().st_mode & 0o777) == 0o600
+        assert hashlib.sha256(artifact.read_bytes()).hexdigest() == rec.file_hash
+        assert rec.file_size == artifact.stat().st_size
+
+        lines = artifact.read_text().splitlines()
+        header = json.loads(lines[0])
+        assert header["version"] == 2 and header["width"] == 80
+        output = "".join(json.loads(line)[2] for line in lines[1:] if json.loads(line)[1] == "o")
+        assert "Welcome to SecurePAM Live Test Terminal" in output
+        assert "recording-marker" in output
+        assert CANARY not in artifact.read_text()  # the credential never reaches the recording
+
+        async with async_session_factory() as db:
+            actions = [a.action for a in (await db.execute(
+                select(AuditLog).where(AuditLog.session_id == uuid.UUID(session_id)))).scalars().all()]
+        assert "RECORDING_STARTED" in actions and "RECORDING_COMPLETED" in actions
+    finally:
+        app.dependency_overrides.pop(get_terminal_gateway, None)
+        server.stop()
+
+
+@pytest.mark.asyncio
+async def test_recording_start_failure_denies_the_session(db_session, operator_token, provider):
+    """If the recorder cannot start, the operator gets no terminal and the
+    session and recording end FAILED."""
+    srv_key = asyncssh.generate_private_key("ssh-ed25519")
+    pub_str = srv_key.export_public_key().decode().strip()
+    server = ThreadedSSHServer(srv_key)
+    port = server.start()
+    gateway = AsyncSSHTerminalGateway(host_key_validator=SSHHostKeyValidator(known_hosts_data=f"127.0.0.1 {pub_str}\n"))
+    app.dependency_overrides[get_terminal_gateway] = lambda: gateway
+    try:
+        sc, asset = await _seed_live_scenario(db_session, port, f"127.0.0.1 {pub_str}\n", expires_in_seconds=1800)
+        asset.recording_required = True
+        await db_session.commit()
+        client = TestClient(app)
+        data = client.post(
+            "/api/v1/sessions/ssh/launch",
+            headers=auth_header(operator_token),
+            json={"request_id": str(sc.access_request_id), "asset_id": str(asset.id)},
+        ).json()
+        session_id, recording_id = uuid.UUID(data["session_id"]), uuid.UUID(data["recording_id"])
+        async with async_session_factory() as db:
+            Path((await db.get(Recording, recording_id)).file_path).write_text("pre-existing")  # O_EXCL fails
+
+        with client.websocket_connect(f"/api/v1/sessions/ssh/{session_id}/ws?ticket={data['ticket']}") as ws:
+            assert "recording could not start" in ws.receive_text().lower()
+
+        async with async_session_factory() as db:
+            assert (await db.get(Session, session_id)).status == "FAILED"
+            assert (await db.get(Recording, recording_id)).status == "FAILED"
+            actions = [a.action for a in (await db.execute(
+                select(AuditLog).where(AuditLog.session_id == session_id))).scalars().all()]
+        assert "RECORDING_FAILED" in actions and "RECORDING_STARTED" not in actions
+        assert gateway.get_live_connection(session_id) is None
     finally:
         app.dependency_overrides.pop(get_terminal_gateway, None)
         server.stop()

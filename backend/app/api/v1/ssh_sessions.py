@@ -52,6 +52,7 @@ from app.services.credential_service import (
 )
 from app.services.jit_service import JITService
 from app.services.ssh_gateway import SSHError, SSHGateway, get_ssh_gateway
+from app.services.terminal_recorder import RecordingError, TerminalRecorder, storage_writable
 from app.services.ssh_terminal_gateway import (
     AsyncSSHTerminalGateway,
     MAX_TERMINAL_CHUNK_SIZE,
@@ -82,9 +83,55 @@ class CreateSSHSessionRequest(BaseModel):
 
 
 def _recording_unavailable(asset: Asset, access_request: AccessRequest) -> bool:
-    """Recording is required but terminal capture does not exist yet."""
+    """Recording is required but recordings cannot be written right now."""
     required = asset.recording_required or access_request.recording_required
-    return required and not settings.SSH_ALLOW_UNRECORDED_SESSIONS
+    return required and not storage_writable()
+
+
+async def _finish_recording(
+    recording_id: uuid.UUID,
+    *,
+    recorder: Optional[TerminalRecorder],
+    actor_id: uuid.UUID,
+    session_id: uuid.UUID,
+    failure_reason: Optional[str] = None,
+) -> None:
+    """Close the recorder and store the outcome. A recording is COMPLETED only
+    when the recorder ran and its artifact was closed and hashed."""
+    result = None
+    if recorder is not None and recorder.running and failure_reason is None:
+        try:
+            result = recorder.close()
+        except RecordingError as exc:
+            failure_reason = f"FINALIZE_FAILED: {exc}"
+    elif recorder is not None and recorder.running:
+        try:
+            recorder.close()
+        except RecordingError:
+            pass
+    async with async_session_factory() as db:
+        rec = await db.get(Recording, recording_id)
+        actor = await db.get(User, actor_id)
+        if rec is None:
+            return
+        if result is not None:
+            rec.status = "COMPLETED"
+            rec.file_size = result.file_size
+            rec.file_hash = result.file_hash
+            rec.duration_seconds = result.duration_seconds
+            action, severity = "RECORDING_COMPLETED", "INFO"
+            details = {"sha256": result.file_hash, "file_size": result.file_size,
+                       "duration_seconds": result.duration_seconds, "events": result.event_count}
+        else:
+            rec.status = "FAILED"
+            action, severity = "RECORDING_FAILED", "HIGH"
+            details = {"reason": failure_reason or "RECORDING_NOT_STARTED"}
+        await write_audit_log(
+            db, actor=actor, action=action, target_type="recording", target_id=str(rec.id),
+            session_id=session_id, result="SUCCESS" if result else "FAILURE", severity=severity,
+            metadata=details,
+        )
+        await db.commit()
 
 
 async def _fail_launch(
@@ -182,7 +229,7 @@ async def launch_ssh_session(
     if _recording_unavailable(asset, access_request):
         await deny(
             "RECORDING_UNAVAILABLE",
-            "This target requires session recording, which the SSH gateway does not support yet.",
+            "This target requires session recording, but recording storage is unavailable.",
         )
 
     grant = await _jit.validate(db, user_id=current_user.id, target_id=asset.id, protocol="SSH")
@@ -400,8 +447,6 @@ async def launch_ssh_session(
             "mode": "GATEWAY_MEDIATED",
             "protocol": connection.protocol,
             "target_asset": asset.name,
-            "target_host": connection.hostname,
-            "target_port": connection.port,
             "gateway_session_id": connection.gateway_session_id,
             "is_connected": connection.is_connected,
             "direct_access_allowed": False,
@@ -441,10 +486,9 @@ async def _close_session_in_db(
                 session.end_time = now
                 if session.recording_id:
                     rec = await db.get(Recording, session.recording_id)
-                    if rec:
-                        # Truthful recording status: since Member 12 terminal stream capture
-                        # is not yet implemented, recording cannot be marked COMPLETED.
-                        # It is marked FAILED to avoid false audit assurance.
+                    # A recording not finalized as COMPLETED (never started, or the
+                    # session closed some other way) must not look complete.
+                    if rec and rec.status != "COMPLETED":
                         rec.status = "FAILED"
                 event_name = (
                     "SESSION_EXPIRED"
@@ -564,7 +608,9 @@ async def ssh_terminal_websocket(
             await websocket.close(code=status.WS_1008_POLICY_VIOLATION, reason="Access request is not active")
             return
 
-        if _recording_unavailable(asset, access_request):
+        recording_required = asset.recording_required or access_request.recording_required
+        if recording_required and (session.recording_id is None or _recording_unavailable(asset, access_request)):
+            # Required recording must exist for this session and be writable.
             await websocket.close(
                 code=status.WS_1008_POLICY_VIOLATION, reason="Session recording is required but not available"
             )
@@ -581,6 +627,12 @@ async def ssh_terminal_websocket(
         session_asset_id = session.asset_id
         session_request_id = session.request_id
         session_jit_grant_id = session.jit_grant_id
+        session_number = session.session_number
+        session_recording_id = session.recording_id
+        recording_file_path = None
+        if session_recording_id:
+            rec = await db.get(Recording, session_recording_id)
+            recording_file_path = rec.file_path if rec else None
 
         # Check if live connection is already registered
         live_conn = terminal_gateway.get_live_connection(session.id)
@@ -618,8 +670,29 @@ async def ssh_terminal_websocket(
     jit_task = None
     final_status = "COMPLETED"
     final_reason = "SESSION_TERMINATED"
+    recorder: Optional[TerminalRecorder] = None
+    recording_failure: Optional[str] = None
 
     try:
+        # Required recording must be running before any terminal output exists.
+        if session_recording_id:
+            try:
+                if not recording_file_path:
+                    raise RecordingError("Recording has no artifact path")
+                recorder = TerminalRecorder(recording_file_path)
+                recorder.start(width=DEFAULT_COLS, height=DEFAULT_ROWS, title=session_number)
+            except RecordingError as exc:
+                logger.error("Recording could not start for session %s: %s", session_id, exc)
+                recording_failure = "RECORDING_START_FAILED"
+                final_status = "FAILED"
+                final_reason = "RECORDING_START_FAILED"
+                try:
+                    await websocket.send_text(json.dumps(
+                        {"type": "error", "message": "Session recording could not start; access denied."}))
+                except Exception:
+                    pass
+                return
+
         # Transition session state in DB
         now = datetime.now(timezone.utc)
         async with async_session_factory() as db:
@@ -632,10 +705,13 @@ async def ssh_terminal_websocket(
                     session.start_time = now
                 if session.recording_id:
                     rec = await db.get(Recording, session.recording_id)
-                    if rec:
-                        # Truthful recording status: Member 10 does not yet capture terminal streams;
-                        # keep status PENDING rather than falsely asserting RECORDING.
-                        rec.status = "PENDING"
+                    if rec and recorder is not None and recorder.running:
+                        rec.status = "RECORDING"
+                        await write_audit_log(
+                            db, actor=user, action="RECORDING_STARTED", target_type="recording",
+                            target_id=str(rec.id), session_id=session.id, result="SUCCESS", severity="INFO",
+                            metadata={"format": "asciicast-v2", "captures": "output,resize"},
+                        )
                 db.add(SessionEvent(session_id=session.id, event_type="SESSION_STARTED", timestamp=now, details={"protocol": "SSH"}))
                 await write_audit_log(
                     db,
@@ -648,7 +724,8 @@ async def ssh_terminal_websocket(
                     source_ip=websocket.client.host if websocket.client else None,
                     result="SUCCESS",
                     severity="INFO",
-                    metadata={"protocol": "SSH", "session_number": session.session_number, "recording_captured": False},
+                    metadata={"protocol": "SSH", "session_number": session.session_number,
+                              "recording_captured": recorder is not None and recorder.running},
                 )
                 await db.commit()
 
@@ -662,6 +739,7 @@ async def ssh_terminal_websocket(
 
         # 4. Bidirectional terminal pump with periodic JIT & auth revalidation
         async def stdout_pump():
+            nonlocal final_status, final_reason, recording_failure
             try:
                 while True:
                     chunk = await proc.stdout.read(MAX_TERMINAL_CHUNK_SIZE)
@@ -672,9 +750,17 @@ async def ssh_terminal_websocket(
                         except Exception:
                             pass
                         break
+                    if recorder is not None:
+                        # Record before display: nothing reaches the operator unrecorded.
+                        recorder.output(chunk)
                     await websocket.send_text(json.dumps({"type": "output", "data": chunk}))
             except (asyncio.CancelledError, WebSocketDisconnect):
                 pass
+            except RecordingError as exc:
+                # Fail closed: a required recording that stops working ends the session.
+                logger.error("Recording failed mid-session %s: %s", session_id, exc)
+                recording_failure = "RECORDING_WRITE_FAILED"
+                final_status, final_reason = "FAILED", "RECORDING_WRITE_FAILED"
             except Exception as exc:
                 logger.warning("Error in SSH stdout pump for session %s: %s", session_id, exc)
 
@@ -703,6 +789,8 @@ async def ssh_terminal_websocket(
                                     valid_rows = max(MIN_ROWS, min(rows, MAX_ROWS))
                                     try:
                                         proc.change_terminal_size(valid_cols, valid_rows)
+                                        if recorder is not None:
+                                            recorder.resize(valid_cols, valid_rows)
                                     except Exception as exc:
                                         logger.warning("Terminal resize failed: %s", exc)
                                 continue
@@ -863,6 +951,16 @@ async def ssh_terminal_websocket(
                 await terminal_gateway.close_connection(session_id)
             except Exception as exc:
                 logger.warning("Error closing SSH connection in gateway for %s: %s", session_id, exc)
+
+            # Finalize the recording first, so the session close sees its outcome.
+            if session_recording_id:
+                try:
+                    await _finish_recording(
+                        session_recording_id, recorder=recorder, actor_id=session_user_id,
+                        session_id=session_id, failure_reason=recording_failure,
+                    )
+                except Exception as exc:
+                    logger.error("Error finalizing recording for %s: %s", session_id, exc)
 
             # Update database session state
             try:

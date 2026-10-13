@@ -648,3 +648,57 @@ async def test_deleted_or_missing_recordings_404(client, db_session, storage, au
     for rec_id in (deleted.id, missing.id, NIL):
         r = await client.get(f"/api/v1/recordings/{rec_id}/stream", headers=auth_header(auditor_token))
         assert r.status_code == 404
+
+
+# --- recording integrity ---------------------------------------------------
+
+async def _hashed_recording(db, storage, name, content: bytes, recording_type="TERMINAL") -> Recording:
+    import hashlib
+    path = storage / name
+    path.write_bytes(content)
+    s = await _make_session(db)
+    rec = Recording(session_id=s.id, recording_type=recording_type, status="COMPLETED",
+                    file_path=str(path), file_hash=hashlib.sha256(content).hexdigest(), file_size=len(content))
+    db.add(rec)
+    await db.commit()
+    return rec
+
+
+async def test_tampered_recording_is_refused_and_audited(client, db_session, storage, auditor_token):
+    rec = await _hashed_recording(db_session, storage, "t.cast", b'{"version": 2}\n')
+    (storage / "t.cast").write_bytes(b'{"version": 2}\n[0.1, "o", "forged"]\n')
+    r = await client.get(f"/api/v1/recordings/{rec.id}/stream", headers=auth_header(auditor_token))
+    assert r.status_code == 409 and "forged" not in r.text
+    (failed,) = await _actions(db_session, "RECORDING_INTEGRITY_FAILED")
+    assert failed.target_id == str(rec.id)
+    assert await _actions(db_session, "RECORDING_VIEWED") == []
+
+
+async def test_verified_terminal_recording_streams_as_asciicast(client, db_session, storage, auditor_token):
+    content = b'{"version": 2, "width": 80, "height": 24}\n[0.1, "o", "hello"]\n'
+    rec = await _hashed_recording(db_session, storage, "ok.cast", content)
+    r = await client.get(f"/api/v1/recordings/{rec.id}/stream", headers=auth_header(auditor_token))
+    assert r.status_code == 200 and r.content == content
+    assert r.headers["content-type"].startswith("application/x-asciicast")
+    assert r.headers["x-recording-sha256"] == rec.file_hash
+
+
+@pytest.mark.parametrize("state", ["PENDING", "RECORDING", "FAILED"])
+async def test_incomplete_recordings_cannot_be_played(client, db_session, storage, auditor_token, state):
+    (storage / "partial.cast").write_bytes(b"x")
+    rec = await _recording(db_session, str(storage / "partial.cast"), status=state)
+    r = await client.get(f"/api/v1/recordings/{rec.id}/stream", headers=auth_header(auditor_token))
+    assert r.status_code == 409
+
+
+async def test_recording_list_reports_integrity_and_hides_paths(client, db_session, storage, auditor_token):
+    good = await _hashed_recording(db_session, storage, "good.cast", b"good")
+    bad = await _hashed_recording(db_session, storage, "bad.cast", b"bad")
+    (storage / "bad.cast").write_bytes(b"changed")
+    r = await client.get("/api/v1/recordings/", headers=auth_header(auditor_token))
+    assert r.status_code == 200
+    items = {i["id"]: i for i in r.json()["items"]}
+    assert items[str(good.id)]["integrity"] == "verified"
+    assert items[str(bad.id)]["integrity"] == "mismatch"
+    assert items[str(good.id)]["operator_username"] == "operator"
+    assert str(storage) not in r.text and "file_path" not in r.text

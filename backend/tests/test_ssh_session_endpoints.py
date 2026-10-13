@@ -109,6 +109,13 @@ def provider():
     app.dependency_overrides.pop(get_credential_service, None)
 
 
+
+@pytest.fixture(autouse=True)
+def _recording_storage(tmp_path, monkeypatch):
+    """Recordings go to a writable per-test directory (the default /data path is not)."""
+    monkeypatch.setattr(settings, "RECORDING_STORAGE_PATH", str(tmp_path / "recordings"))
+
+
 # --- Authentication & RBAC --------------------------------------------------
 
 async def test_unauthenticated_ssh_launch_rejected(client):
@@ -375,9 +382,7 @@ async def test_successful_ssh_launch_orchestration_with_pending_gateway(
     """
     With the default PendingSSHGateway, the launch succeeds and prepares the session,
     but does NOT falsely mark the session ACTIVE or the recording RECORDING.
-    (Recording is required here, so unrecorded sessions must be explicitly allowed.)
     """
-    monkeypatch.setattr(settings, "SSH_ALLOW_UNRECORDED_SESSIONS", True)
     req = await _ssh_ready(db_session)
     asset = await db_session.get(Asset, req.asset_id)
     asset.recording_required = True
@@ -396,8 +401,8 @@ async def test_successful_ssh_launch_orchestration_with_pending_gateway(
     assert body["connection"]["mode"] == "GATEWAY_MEDIATED"
     assert body["connection"]["protocol"] == "ssh"
     assert body["connection"]["target_asset"] == "LINUX-DEV-01"
-    assert body["connection"]["target_host"] == "linux-dev-01.internal"
-    assert body["connection"]["target_port"] == 22
+    # The internal address is never sent to the browser.
+    assert "target_host" not in body["connection"] and "linux-dev-01.internal" not in r.text
     assert body["connection"]["direct_access_allowed"] is False
     assert body["connection"]["is_connected"] is False
     assert "direct connections to the target are not permitted" in body["connection"]["message"]
@@ -460,7 +465,6 @@ async def test_connected_gateway_transitions_session_to_active(
     is not yet integrated (pending Member 12), the recording truthfully remains PENDING
     rather than falsely asserting RECORDING.
     """
-    monkeypatch.setattr(settings, "SSH_ALLOW_UNRECORDED_SESSIONS", True)
     app.dependency_overrides[get_ssh_gateway] = lambda: MockConnectedSSHGateway()
     try:
         req = await _ssh_ready(db_session)
@@ -499,9 +503,21 @@ async def test_connected_gateway_transitions_session_to_active(
 
 
 
-# --- Recording required but not available: refused by default --------------
 
-async def test_launch_refused_when_recording_required_but_unavailable(client, db_session, operator_token, provider):
+# --- Recording required but storage unavailable: refused ------------------
+
+@pytest.fixture
+def unwritable_storage(tmp_path, monkeypatch):
+    locked = tmp_path / "locked"
+    locked.mkdir(mode=0o500)
+    monkeypatch.setattr(settings, "RECORDING_STORAGE_PATH", str(locked / "recordings"))
+    yield
+    locked.chmod(0o700)
+
+
+async def test_launch_refused_when_recording_required_but_storage_unavailable(
+    client, db_session, operator_token, provider, unwritable_storage
+):
     req = await _ssh_ready(db_session)
     asset = await db_session.get(Asset, req.asset_id)
     asset.recording_required = True
@@ -516,18 +532,12 @@ async def test_launch_refused_when_recording_required_but_unavailable(client, db
     assert len((await db_session.execute(select(Session))).scalars().all()) == sessions_before
 
 
-async def test_launch_refused_when_request_requires_recording(client, db_session, operator_token, provider):
+async def test_launch_refused_when_request_requires_recording_and_storage_unavailable(
+    client, db_session, operator_token, provider, unwritable_storage
+):
     req = await _ssh_ready(db_session)
     access_request = await db_session.get(AccessRequest, req.access_request_id)
     access_request.recording_required = True
     await db_session.commit()
     r = await client.post("/api/v1/sessions/ssh/launch", headers=auth_header(operator_token), json=_launch_body(req))
     assert r.status_code == 403
-
-
-def test_production_refuses_unrecorded_ssh_sessions():
-    from app.core.config import Settings, SettingsError
-    with pytest.raises(SettingsError, match="SSH_ALLOW_UNRECORDED_SESSIONS"):
-        Settings(_env_file=None, ENVIRONMENT="production", DEV_MODE=False, SECRET_KEY="x" * 48,
-                 SECRET_PROVIDER="openbao", OPENBAO_ADDR="https://bao:8200", OPENBAO_TOKEN="t",
-                 SSH_ALLOW_UNRECORDED_SESSIONS=True)

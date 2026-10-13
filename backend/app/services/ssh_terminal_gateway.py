@@ -146,7 +146,10 @@ class AsyncSSHTerminalGateway:
         conn: Optional[asyncssh.SSHClientConnection] = None
         try:
             conn = await asyncssh.connect(
-                host=asset.hostname,
+                # Dial the registered IP when there is one: the address is pinned
+                # (no DNS lookup to rebind) and works for hosts without DNS names.
+                # The trusted known_hosts entry is matched against hostname or IP.
+                host=asset.ip_address or asset.hostname,
                 port=asset.port,
                 username=username,
                 password=password,

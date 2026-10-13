@@ -20,6 +20,7 @@ from app.models.session import Session, SessionEvent
 from app.secret_providers import MockSecretProvider
 from app.services.credential_service import CredentialAccessDenied, CredentialService
 from app.services.jit_service import JITService
+from tests.conftest import auth_header
 from tests.test_credential_service import PASSWORD, PATH, _scenario
 
 STRONG_KEY = "k" * 48
@@ -149,9 +150,9 @@ async def test_revoked_grant_session_cannot_check_out_credentials(db_session):
 
 # --- health detail sanitization ----------------------------------------------
 
-async def test_health_does_not_leak_dependency_errors(client, monkeypatch):
+async def test_health_does_not_leak_dependency_errors(client, admin_token, monkeypatch):
     monkeypatch.setattr(settings, "REDIS_URL", "redis://leaky-internal-host.invalid:6399/0")
-    r = await client.get("/health/detailed")
+    r = await client.get("/health/detailed", headers=auth_header(admin_token))
     redis = next(s for s in r.json()["services"] if s["service"] == "redis")
     assert redis["status"] == "unhealthy"
     assert redis["details"] == "redis unreachable"

@@ -3,6 +3,8 @@
 import pytest
 from httpx import AsyncClient
 
+from tests.conftest import auth_header
+
 
 async def test_app_starts_and_root_health_responds(client: AsyncClient):
     """Covers 'application startup' — the ASGI app served a request at all."""
@@ -36,18 +38,45 @@ async def test_readiness_reports_database_and_redis_healthy(client: AsyncClient)
     assert services["redis"] == "healthy"
 
 
-async def test_detailed_health_reports_all_dev_mode_services_healthy(client: AsyncClient):
+async def test_detailed_health_requires_authentication(client: AsyncClient):
     resp = await client.get("/health/detailed")
+    assert resp.status_code == 401
+
+
+async def test_detailed_health_reports_dev_mode_truthfully(client: AsyncClient, operator_token, tmp_path, monkeypatch):
+    """Development stand-ins are reported as mock and undeployed gateways as
+    not_configured, never as healthy; only real failures degrade the overall status."""
+    from app.core.config import settings
+    monkeypatch.setattr(settings, "RECORDING_STORAGE_PATH", str(tmp_path / "recordings"))
+    monkeypatch.delenv("SECUREPAM_KNOWN_HOSTS_PATH", raising=False)
+    resp = await client.get("/health/detailed", headers=auth_header(operator_token))
     assert resp.status_code == 200
     body = resp.json()
-    assert body["status"] == "healthy"
     services = {s["service"]: s["status"] for s in body["services"]}
     assert services["database"] == "healthy"
     assert services["redis"] == "healthy"
-    assert services["identity_provider"] == "healthy"
-    assert services["vault"] == "healthy"
-    assert services["gateway"] == "healthy"
-    assert services["siem"] == "healthy"
+    assert services["identity_provider"] == "mock"
+    assert services["vault"] == "mock"
+    assert services["gateway_ssh"] == "not_configured"
+    assert services["gateway_rdp"] == "not_configured"
+    assert services["gateway_web"] == "not_configured"
+    assert services["siem"] == "not_configured"
+    assert services["recording_storage"] == "healthy"
+    assert body["status"] == "healthy"
+
+
+async def test_detailed_health_reports_unwritable_recording_storage(client: AsyncClient, operator_token, tmp_path, monkeypatch):
+    from app.core.config import settings
+    locked = tmp_path / "locked"
+    locked.mkdir(mode=0o500)
+    monkeypatch.setattr(settings, "RECORDING_STORAGE_PATH", str(locked / "recordings"))
+    try:
+        body = (await client.get("/health/detailed", headers=auth_header(operator_token))).json()
+        storage = next(s for s in body["services"] if s["service"] == "recording_storage")
+        assert storage["status"] == "unhealthy" and body["status"] == "unhealthy"
+    finally:
+        locked.chmod(0o700)
+
 
 async def test_health_preserves_caller_supplied_request_id(client: AsyncClient):
     request_id = "securepam-test-request-123"

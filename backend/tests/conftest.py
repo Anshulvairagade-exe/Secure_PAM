@@ -65,7 +65,7 @@ async def _prepared_database():
         await conn.run_sync(Base.metadata.drop_all)
         await conn.run_sync(Base.metadata.create_all)
 
-    await _seed_default_data()
+    await _seed_default_data(include_sample_targets=True)  # sample targets are test fixtures
 
     yield
 

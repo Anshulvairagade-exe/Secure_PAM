@@ -76,6 +76,8 @@ class SessionResponse(BaseModel):
     start_time: Optional[datetime]
     end_time: Optional[datetime]
     recording_id: Optional[uuid.UUID]
+    asset_name: Optional[str] = None
+    recording_status: Optional[str] = None
 
 
 def _can_view_all(user: User) -> bool:
@@ -128,9 +130,15 @@ async def list_sessions(
     if not pagination.sort_by or pagination.sort_by not in _SORTABLE_COLUMNS:
         query = query.order_by(Session.created_at.desc())
 
-    return await paginate(
-        db, query, pagination, schema=SessionResponse
-    )
+    page = await paginate(db, query, pagination, schema=SessionResponse)
+    for item in page.items:
+        if item.asset_id:
+            asset = await db.get(Asset, item.asset_id)
+            item.asset_name = asset.name if asset else None
+        if item.recording_id:
+            recording = await db.get(Recording, item.recording_id)
+            item.recording_status = recording.status if recording else None
+    return page
 
 
 
