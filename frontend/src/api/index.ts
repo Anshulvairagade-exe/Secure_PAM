@@ -14,6 +14,10 @@ import type {
   AssetInput,
   CredentialRef,
   CredentialRefInput,
+  Recording,
+  Session,
+  SSHLaunchResponse,
+  SystemSettings,
   Application,
   ApplicationInput,
   Policy,
@@ -176,6 +180,40 @@ export const auditApi = {
 };
 
 // --- Health ---
+
+// --- Sessions ---
+
+export const sessionsApi = {
+  list: (params?: ListParams) =>
+    apiClient.get<PaginatedResponse<Session>>('/sessions/', { params }).then(r => r.data),
+
+  launchSSH: (requestId: string, assetId: string) =>
+    apiClient
+      .post<SSHLaunchResponse>('/sessions/ssh/launch', { request_id: requestId, asset_id: assetId })
+      .then(r => r.data),
+
+  terminate: (id: string) =>
+    apiClient.post(`/sessions/${id}/terminate`).then(r => r.data),
+};
+
+// --- Recordings (evidence; AUDITOR and ADMIN only, enforced server-side) ---
+
+export const recordingsApi = {
+  list: (params?: ListParams) =>
+    apiClient.get<PaginatedResponse<Recording>>('/recordings/', { params }).then(r => r.data),
+
+  /** Raw asciicast text; the server re-verifies the SHA-256 before serving. */
+  terminalCast: (id: string) =>
+    apiClient
+      .get<string>(`/recordings/${id}/stream`, { responseType: 'text', transformResponse: r => r })
+      .then(r => r.data),
+};
+
+// --- Settings ---
+
+export const settingsApi = {
+  summary: () => apiClient.get<SystemSettings>('/settings/summary').then(r => r.data),
+};
 
 export const healthApi = {
   detailed: () =>

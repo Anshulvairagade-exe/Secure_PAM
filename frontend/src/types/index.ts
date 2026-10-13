@@ -268,6 +268,18 @@ export interface Session {
   asset_name?: string;
   application_name?: string;
   user_name?: string;
+  recording_status?: Recording['status'] | null;
+}
+
+/** POST /sessions/ssh/launch. The one-time ticket is sent in the first
+ * WebSocket frame, never in a URL. */
+export interface SSHLaunchResponse {
+  session_id: string;
+  session_number: string;
+  status: SessionStatus;
+  recording_id: string | null;
+  ticket: string;
+  ws_url: string;
 }
 
 // --- Recordings ---
@@ -280,6 +292,32 @@ export interface Recording {
   duration_seconds?: number;
   retention_date?: string;
   created_at: string;
+  session_number?: string | null;
+  operator_username?: string | null;
+  asset_name?: string | null;
+  protocol?: string | null;
+  started_at?: string | null;
+  ended_at?: string | null;
+  sha256?: string | null;
+  integrity: 'verified' | 'mismatch' | 'missing' | 'not_available';
+}
+
+export interface SystemSettings {
+  environment: string;
+  version: string;
+  dev_mode: boolean;
+  authentication: string;
+  secret_provider: string;
+  jit_default_minutes: number;
+  jit_max_minutes: number;
+  session_default_timeout_minutes: number;
+  session_max_timeout_minutes: number;
+  rate_limit_per_minute: number;
+  rate_limit_login_per_minute: number;
+  recording_storage_writable: boolean;
+  recording_retention_days?: number | null;
+  ssh_recording_format: string;
+  managed_by: string;
 }
 
 // --- Audit ---
@@ -351,7 +389,7 @@ export interface HealthCheck {
 
 export interface ServiceHealth {
   service: string;
-  status: 'healthy' | 'unhealthy' | 'degraded';
+  status: 'healthy' | 'unhealthy' | 'degraded' | 'mock' | 'not_configured';
   latency_ms?: number;
   details?: string;
 }

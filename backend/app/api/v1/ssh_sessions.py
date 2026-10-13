@@ -514,7 +514,6 @@ async def _close_session_in_db(
 async def ssh_terminal_websocket(
     websocket: WebSocket,
     session_id: uuid.UUID,
-    ticket: Optional[str] = None,
     ticket_service: SSHTicketService = Depends(get_ssh_ticket_service),
     terminal_gateway: AsyncSSHTerminalGateway = Depends(get_terminal_gateway),
     credentials: CredentialService = Depends(get_credential_service),
@@ -523,7 +522,7 @@ async def ssh_terminal_websocket(
     Authenticated WebSocket terminal bridge for live interactive SSH sessions.
 
     Security & Integrity Controls:
-    - Ticket required: Must be presented via query param ?ticket= or initial JSON auth frame.
+    - Ticket required: the first frame must be {"type": "auth", "ticket": ...}; never a URL parameter.
     - Single-use atomic consumption via Redis GETDEL.
     - Bound cryptographically to session_id, user_id, asset_id, request_id, and jit_grant_id.
     - Authoritative database revalidation of user, asset, request, and live JIT grant.
@@ -533,23 +532,16 @@ async def ssh_terminal_websocket(
     """
     await websocket.accept()
 
-    # 1. Ticket extraction
-    if not ticket:
-        ticket = websocket.query_params.get("ticket")
-
-    if not ticket:
-        try:
-            first_msg = await asyncio.wait_for(websocket.receive_text(), timeout=5.0)
-            try:
-                parsed = json.loads(first_msg)
-                if isinstance(parsed, dict) and parsed.get("type") == "auth":
-                    ticket = parsed.get("ticket")
-                elif isinstance(parsed, dict) and "ticket" in parsed:
-                    ticket = parsed.get("ticket")
-            except (json.JSONDecodeError, ValueError):
-                pass
-        except (asyncio.TimeoutError, WebSocketDisconnect):
-            pass
+    # 1. Ticket extraction: only from the first frame, never the URL, so the
+    # one-time ticket cannot end up in proxy or access logs.
+    ticket = None
+    try:
+        first_msg = await asyncio.wait_for(websocket.receive_text(), timeout=5.0)
+        parsed = json.loads(first_msg)
+        if isinstance(parsed, dict) and parsed.get("type") == "auth":
+            ticket = parsed.get("ticket")
+    except (asyncio.TimeoutError, WebSocketDisconnect, json.JSONDecodeError, ValueError):
+        pass
 
     if not ticket or not isinstance(ticket, str):
         await websocket.close(code=status.WS_1008_POLICY_VIOLATION, reason="Ticket required")

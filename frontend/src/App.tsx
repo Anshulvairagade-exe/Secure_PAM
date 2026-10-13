@@ -13,6 +13,9 @@ import AccessRequestDetail from '@/pages/AccessRequestDetail';
 import ApprovalsPage from '@/pages/Approvals';
 import AuditLogs from '@/pages/AuditLogs';
 import VaultReferences from '@/pages/VaultReferences';
+import Sessions from '@/pages/Sessions';
+import Recordings from '@/pages/Recordings';
+import SettingsPage from '@/pages/SettingsPage';
 import ComingSoon from '@/pages/ComingSoon';
 import NotFound from '@/pages/NotFound';
 
@@ -32,7 +35,7 @@ export default function App() {
         <Route path="/access-requests" element={<AccessRequests />} />
         <Route path="/access-requests/new" element={<AccessRequestNew />} />
         <Route path="/access-requests/:id" element={<AccessRequestDetail />} />
-        <Route path="/sessions" element={<ComingSoon title="My Sessions" phase="Phase 8" />} />
+        <Route path="/sessions" element={<Sessions />} />
         <Route path="/assets" element={<Assets />} />
         <Route path="/applications" element={<Applications />} />
         <Route
@@ -47,7 +50,7 @@ export default function App() {
           path="/recordings"
           element={
             <ProtectedRoute requiredRoles={['ADMIN', 'AUDITOR']}>
-              <ComingSoon title="Recording Center" phase="Phase 10 / 14" />
+              <Recordings />
             </ProtectedRoute>
           }
         />
@@ -99,7 +102,7 @@ export default function App() {
             </ProtectedRoute>
           }
         />
-        <Route path="/settings" element={<ComingSoon title="Settings" phase="Phase 16" />} />
+        <Route path="/settings" element={<SettingsPage />} />
       </Route>
 
       <Route path="*" element={<NotFound />} />

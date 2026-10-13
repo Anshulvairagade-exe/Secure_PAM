@@ -210,8 +210,10 @@ async def test_live_ssh_terminal_bidirectional_and_resize(db_session, operator_t
         assert CANARY not in json.dumps(launch_data)
 
         # 2. Connect live WebSocket with ticket
-        ws_url = f"/api/v1/sessions/ssh/{session_id}/ws?ticket={ticket}"
+        ws_url = f"/api/v1/sessions/ssh/{session_id}/ws"
+        assert "ticket" not in ws_url  # the ticket travels in the first frame only
         with client.websocket_connect(ws_url) as ws:
+            ws.send_text(json.dumps({"type": "auth", "ticket": ticket}))
             # Receive greeting banner
             banner_raw = ws.receive_text()
             banner = json.loads(banner_raw)
@@ -305,12 +307,14 @@ async def test_websocket_ticket_replay_rejected(db_session, operator_token, prov
         ticket = data["ticket"]
 
         # First connection: consumes ticket
-        with client.websocket_connect(f"/api/v1/sessions/ssh/{session_id}/ws?ticket={ticket}") as ws:
+        with client.websocket_connect(f"/api/v1/sessions/ssh/{session_id}/ws") as ws:
+            ws.send_text(json.dumps({"type": "auth", "ticket": ticket}))
             ws.receive_text()
 
         # Second connection with same ticket: MUST be rejected
         with pytest.raises(Exception):
-            with client.websocket_connect(f"/api/v1/sessions/ssh/{session_id}/ws?ticket={ticket}") as ws:
+            with client.websocket_connect(f"/api/v1/sessions/ssh/{session_id}/ws") as ws:
+                ws.send_text(json.dumps({"type": "auth", "ticket": ticket}))
                 ws.receive_text()
 
     finally:
@@ -347,7 +351,8 @@ async def test_websocket_ticket_binding_mismatches_rejected(db_session, operator
         # 1. Connecting to different session ID with this ticket
         fake_session_id = str(uuid.uuid4())
         with pytest.raises(Exception):
-            with client.websocket_connect(f"/api/v1/sessions/ssh/{fake_session_id}/ws?ticket={ticket}") as ws:
+            with client.websocket_connect(f"/api/v1/sessions/ssh/{fake_session_id}/ws") as ws:
+                ws.send_text(json.dumps({"type": "auth", "ticket": ticket}))
                 ws.receive_text()
 
         # 2. Fix F-04: Issue ticket bound to wrong asset
@@ -361,9 +366,8 @@ async def test_websocket_ticket_binding_mismatches_rejected(db_session, operator
         )
 
         with pytest.raises(Exception):
-            with client.websocket_connect(
-                f"/api/v1/sessions/ssh/{session_id}/ws?ticket={mismatched_asset_ticket}"
-            ) as ws:
+            with client.websocket_connect(f"/api/v1/sessions/ssh/{session_id}/ws") as ws:
+                ws.send_text(json.dumps({"type": "auth", "ticket": mismatched_asset_ticket}))
                 ws.receive_text()
 
     finally:
@@ -402,7 +406,8 @@ async def test_websocket_missing_or_expired_ticket_rejected(db_session, operator
 
         # Bogus ticket
         with pytest.raises(Exception):
-            with client.websocket_connect(f"/api/v1/sessions/ssh/{session_id}/ws?ticket=bogus-expired-ticket") as ws:
+            with client.websocket_connect(f"/api/v1/sessions/ssh/{session_id}/ws") as ws:
+                ws.send_text(json.dumps({"type": "auth", "ticket": "bogus-expired-ticket"}))
                 ws.receive_text()
 
     finally:
@@ -442,7 +447,8 @@ async def test_websocket_host_key_mismatch_fails_closed(db_session, operator_tok
 
         # WebSocket connection must fail due to host key mismatch
         with pytest.raises(Exception):
-            with client.websocket_connect(f"/api/v1/sessions/ssh/{session_id}/ws?ticket={ticket}") as ws:
+            with client.websocket_connect(f"/api/v1/sessions/ssh/{session_id}/ws") as ws:
+                ws.send_text(json.dumps({"type": "auth", "ticket": ticket}))
                 ws.receive_text()
 
         # Session must be recorded as FAILED in DB
@@ -481,7 +487,8 @@ async def test_websocket_abrupt_disconnect_evicts_registry(db_session, operator_
         session_id = data["session_id"]
         ticket = data["ticket"]
 
-        with client.websocket_connect(f"/api/v1/sessions/ssh/{session_id}/ws?ticket={ticket}") as ws:
+        with client.websocket_connect(f"/api/v1/sessions/ssh/{session_id}/ws") as ws:
+            ws.send_text(json.dumps({"type": "auth", "ticket": ticket}))
             ws.receive_text()  # Read greeting
             # Abrupt disconnect
             ws.close()
@@ -530,7 +537,8 @@ async def test_websocket_in_session_jit_expiry_terminates(db_session, operator_t
         session_id = data["session_id"]
         ticket = data["ticket"]
 
-        with client.websocket_connect(f"/api/v1/sessions/ssh/{session_id}/ws?ticket={ticket}") as ws:
+        with client.websocket_connect(f"/api/v1/sessions/ssh/{session_id}/ws") as ws:
+            ws.send_text(json.dumps({"type": "auth", "ticket": ticket}))
             ws.receive_text()  # Read greeting
             # Wait for JIT monitor to fire (grant expires in 1s)
             error_msg = ws.receive_text()
@@ -580,7 +588,8 @@ async def test_websocket_mid_session_jit_revocation_terminates(db_session, opera
         session_id = data["session_id"]
         ticket = data["ticket"]
 
-        with client.websocket_connect(f"/api/v1/sessions/ssh/{session_id}/ws?ticket={ticket}") as ws:
+        with client.websocket_connect(f"/api/v1/sessions/ssh/{session_id}/ws") as ws:
+            ws.send_text(json.dumps({"type": "auth", "ticket": ticket}))
             ws.receive_text()  # Read greeting banner
 
             # Actively revoke JIT grant mid-session in DB
@@ -657,7 +666,8 @@ async def test_websocket_authorization_revalidation_failure_terminates_fail_clos
             return await orig_get(self, entity, ident, **kwargs)
 
         with patch.object(AsyncSession, "get", new=mocked_get):
-            with client.websocket_connect(f"/api/v1/sessions/ssh/{session_id}/ws?ticket={ticket}") as ws:
+            with client.websocket_connect(f"/api/v1/sessions/ssh/{session_id}/ws") as ws:
+                ws.send_text(json.dumps({"type": "auth", "ticket": ticket}))
                 ws.receive_text()  # Read greeting banner
                 # Trigger DB failure in active monitor
                 fail_trigger = True
@@ -722,7 +732,8 @@ async def test_websocket_db_commit_failure_cleans_up_connection(db_session, oper
 
         with patch.object(AsyncSession, "commit", new=failing_commit):
             try:
-                with client.websocket_connect(f"/api/v1/sessions/ssh/{session_id}/ws?ticket={ticket}") as ws:
+                with client.websocket_connect(f"/api/v1/sessions/ssh/{session_id}/ws") as ws:
+                    ws.send_text(json.dumps({"type": "auth", "ticket": ticket}))
                     ws.receive_text()
             except Exception:
                 pass
@@ -762,7 +773,8 @@ async def test_required_recording_captures_real_artifact(db_session, operator_to
         ).json()
         session_id, recording_id = data["session_id"], uuid.UUID(data["recording_id"])
 
-        with client.websocket_connect(f"/api/v1/sessions/ssh/{session_id}/ws?ticket={data['ticket']}") as ws:
+        with client.websocket_connect(f"/api/v1/sessions/ssh/{session_id}/ws") as ws:
+            ws.send_text(json.dumps({"type": "auth", "ticket": data['ticket']}))
             ws.receive_text()  # greeting
             async with async_session_factory() as db:
                 assert (await db.get(Recording, recording_id)).status == "RECORDING"
@@ -826,7 +838,8 @@ async def test_recording_start_failure_denies_the_session(db_session, operator_t
         async with async_session_factory() as db:
             Path((await db.get(Recording, recording_id)).file_path).write_text("pre-existing")  # O_EXCL fails
 
-        with client.websocket_connect(f"/api/v1/sessions/ssh/{session_id}/ws?ticket={data['ticket']}") as ws:
+        with client.websocket_connect(f"/api/v1/sessions/ssh/{session_id}/ws") as ws:
+            ws.send_text(json.dumps({"type": "auth", "ticket": data['ticket']}))
             assert "recording could not start" in ws.receive_text().lower()
 
         async with async_session_factory() as db:
@@ -868,7 +881,8 @@ async def test_websocket_cancellation_during_pump_cleans_up_connection(db_sessio
         ticket = data["ticket"]
 
         # Connect, read greeting, then exit context abruptly to trigger cancellation
-        with client.websocket_connect(f"/api/v1/sessions/ssh/{session_id}/ws?ticket={ticket}") as ws:
+        with client.websocket_connect(f"/api/v1/sessions/ssh/{session_id}/ws") as ws:
+            ws.send_text(json.dumps({"type": "auth", "ticket": ticket}))
             ws.receive_text()
 
         # Registry must be completely evicted
@@ -914,7 +928,8 @@ async def test_admin_terminate_closes_live_ssh_terminal(db_session, operator_tok
     app.dependency_overrides[get_terminal_gateway] = lambda: gateway
     try:
         client, session_id, ticket = await _live_terminal(db_session, operator_token, port, pub_str)
-        with client.websocket_connect(f"/api/v1/sessions/ssh/{session_id}/ws?ticket={ticket}") as ws:
+        with client.websocket_connect(f"/api/v1/sessions/ssh/{session_id}/ws") as ws:
+            ws.send_text(json.dumps({"type": "auth", "ticket": ticket}))
             ws.receive_text()
             assert gateway.get_live_connection(session_id) is not None
             term = client.post(f"/api/v1/sessions/{session_id}/terminate", headers=auth_header(admin_token))
@@ -940,7 +955,8 @@ async def test_terminal_closes_when_session_ends_on_another_worker(db_session, o
     app.dependency_overrides[get_terminal_gateway] = lambda: gateway
     try:
         client, session_id, ticket = await _live_terminal(db_session, operator_token, port, pub_str)
-        with client.websocket_connect(f"/api/v1/sessions/ssh/{session_id}/ws?ticket={ticket}") as ws:
+        with client.websocket_connect(f"/api/v1/sessions/ssh/{session_id}/ws") as ws:
+            ws.send_text(json.dumps({"type": "auth", "ticket": ticket}))
             ws.receive_text()
             assert gateway.get_live_connection(session_id) is not None
             async with async_session_factory() as db:
@@ -969,7 +985,30 @@ async def test_connect_refused_when_recording_became_required(db_session, operat
             (await db.get(Asset, s.asset_id)).recording_required = True
             await db.commit()
         with pytest.raises(Exception):
+            with client.websocket_connect(f"/api/v1/sessions/ssh/{session_id}/ws") as ws:
+                ws.send_text(json.dumps({"type": "auth", "ticket": ticket}))
+                ws.receive_text()
+        assert gateway.get_live_connection(session_id) is None
+    finally:
+        app.dependency_overrides.pop(get_terminal_gateway, None)
+        server.stop()
+
+
+
+@pytest.mark.asyncio
+async def test_ticket_in_url_is_not_accepted(db_session, operator_token, provider):
+    """A valid ticket in the query string is ignored: only the auth frame counts."""
+    srv_key = asyncssh.generate_private_key("ssh-ed25519")
+    pub_str = srv_key.export_public_key().decode().strip()
+    server = ThreadedSSHServer(srv_key)
+    port = server.start()
+    gateway = AsyncSSHTerminalGateway(host_key_validator=SSHHostKeyValidator(known_hosts_data=f"127.0.0.1 {pub_str}\n"))
+    app.dependency_overrides[get_terminal_gateway] = lambda: gateway
+    try:
+        client, session_id, ticket = await _live_terminal(db_session, operator_token, port, pub_str)
+        with pytest.raises(Exception):
             with client.websocket_connect(f"/api/v1/sessions/ssh/{session_id}/ws?ticket={ticket}") as ws:
+                ws.send_text(json.dumps({"type": "input", "data": "whoami\n"}))  # not an auth frame
                 ws.receive_text()
         assert gateway.get_live_connection(session_id) is None
     finally:
