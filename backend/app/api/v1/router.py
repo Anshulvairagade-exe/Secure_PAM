@@ -17,6 +17,8 @@ from app.api.v1.credential_refs import router as credential_refs_router
 from app.api.v1.sessions import router as sessions_router
 from app.api.v1.recordings import router as recordings_router
 from app.api.v1.audit import router as audit_router
+# Member 10 Router
+from app.api.v1.ssh_sessions import router as ssh_sessions_router
 
 # Main v1 router
 api_router = APIRouter()
@@ -34,3 +36,5 @@ api_router.include_router(credential_refs_router)
 api_router.include_router(sessions_router)
 api_router.include_router(recordings_router)
 api_router.include_router(audit_router)
+# Registered Member 10 sub-router
+api_router.include_router(ssh_sessions_router)
