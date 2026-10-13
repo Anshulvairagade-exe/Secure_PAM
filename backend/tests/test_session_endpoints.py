@@ -380,16 +380,20 @@ async def test_launch_success_uses_jit_and_credential_service(client, db_session
 
     assert CANARY not in r.text and "svc-rdp" not in r.text
     assert "recording_path" not in r.text and "file_path" not in r.text
-    assert body["connection"] == {"protocol": "rdp", "hostname": "win-dev-01.internal", "port": 3389}
+    assert body["connection"] == {"protocol": "rdp", "hostname": "win-dev-01.internal", "port": 3389,
+                                  "is_connected": False}
+    assert "No RDP connection was made" in body["message"]
     assert provider.reads == [RDP_PATH]
 
     s = await db_session.get(Session, uuid.UUID(body["session_id"]))
     assert s.user_id == req.user_id  # the real caller, not a random UUID
     assert s.jit_grant_id == req.jit_grant_id
-    assert s.status == "ACTIVE" and s.start_time is not None
+    # The placeholder gateway never connects: not ACTIVE, no start time.
+    assert s.status == "STARTING" and s.start_time is None
 
-    (started,) = await _actions(db_session, "SESSION_STARTED")
-    assert started.actor_username == "operator" and started.session_id == s.id
+    (prepared,) = await _actions(db_session, "SESSION_PREPARED")
+    assert prepared.actor_username == "operator" and prepared.session_id == s.id
+    assert await _actions(db_session, "SESSION_STARTED") == []
     (retrieved,) = await _actions(db_session, "CREDENTIAL_RETRIEVED")
     assert retrieved.session_id == s.id
     for row in (await db_session.execute(select(AuditLog))).scalars().all():
@@ -405,8 +409,34 @@ async def test_launch_creates_recording_when_required(client, db_session, operat
     r = await client.post("/api/v1/sessions/rdp/launch", headers=auth_header(operator_token), json=_launch_body(req))
     assert r.status_code == 201
     rec = await db_session.get(Recording, uuid.UUID(r.json()["recording_id"]))
-    assert rec.status == "RECORDING"
+    assert rec.status == "PENDING"  # nothing is being recorded until a real connection exists
     assert rec.file_path.startswith(settings.RECORDING_STORAGE_PATH)
+
+
+async def test_launch_with_connected_gateway_is_active_and_recording(client, db_session, operator_token, provider):
+    from app.services.rdp_gateway import GatewayConnection, get_rdp_gateway
+
+    class ConnectedGateway:
+        async def prepare(self, *, session, asset, credential):
+            return GatewayConnection(protocol="rdp", hostname=asset.hostname, port=asset.port,
+                                     gateway_session_id="gw-1", is_connected=True)
+
+    app.dependency_overrides[get_rdp_gateway] = lambda: ConnectedGateway()
+    try:
+        req = await _rdp_ready(db_session)
+        asset = await db_session.get(Asset, req.asset_id)
+        asset.recording_required = True
+        await db_session.commit()
+        r = await client.post("/api/v1/sessions/rdp/launch", headers=auth_header(operator_token), json=_launch_body(req))
+        assert r.status_code == 201 and r.json()["status"] == "ACTIVE"
+        s = await db_session.get(Session, uuid.UUID(r.json()["session_id"]))
+        assert s.start_time is not None
+        rec = await db_session.get(Recording, uuid.UUID(r.json()["recording_id"]))
+        assert rec.status == "RECORDING"
+        (started,) = await _actions(db_session, "SESSION_STARTED")
+        assert started.session_id == s.id
+    finally:
+        app.dependency_overrides.pop(get_rdp_gateway, None)
 
 
 @pytest.mark.parametrize("grant_status", ["REVOKED", "EXPIRED"])

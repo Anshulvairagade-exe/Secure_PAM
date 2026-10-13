@@ -253,15 +253,26 @@ async def launch_rdp_session(
         raise HTTPException(status.HTTP_502_BAD_GATEWAY, "Session gateway could not start the session.")
 
     now = datetime.now(timezone.utc)
-    session.status = "ACTIVE"
-    session.start_time = now
     session.gateway_session_id = connection.gateway_session_id
-    if recording:
-        recording.status = "RECORDING"
-    db.add(SessionEvent(session_id=session.id, event_type="SESSION_STARTED", timestamp=now,
+    if connection.is_connected:
+        session.status = "ACTIVE"
+        session.start_time = now
+        if recording:
+            recording.status = "RECORDING"
+        event, message = "SESSION_STARTED", "RDP session connected through the SecurePAM gateway."
+    else:
+        # Placeholder gateway (no Guacamole yet): the credential was checked out
+        # and handed to the gateway, but no RDP connection exists. Report that
+        # truthfully instead of claiming a live, recorded session.
+        session.status = "STARTING"
+        event, message = "SESSION_PREPARED", (
+            "Session prepared and credential checked out, but the RDP gateway is not "
+            "connected yet (Guacamole integration pending). No RDP connection was made."
+        )
+    db.add(SessionEvent(session_id=session.id, event_type=event, timestamp=now,
                         details={"protocol": "RDP", "recording": recording is not None}))
     await write_audit_log(
-        db, actor=current_user, action="SESSION_STARTED", target_type="asset", target_id=str(asset.id),
+        db, actor=current_user, action=event, target_type="asset", target_id=str(asset.id),
         request_id=access_request.id, session_id=session.id, source_ip=source_ip,
         result="SUCCESS", severity="INFO",
         metadata={"protocol": "RDP", "session_number": session.session_number,
@@ -274,7 +285,9 @@ async def launch_rdp_session(
         "session_number": session.session_number,
         "status": session.status,
         "recording_id": str(recording.id) if recording else None,
-        "connection": {"protocol": connection.protocol, "hostname": connection.hostname, "port": connection.port},
+        "connection": {"protocol": connection.protocol, "hostname": connection.hostname, "port": connection.port,
+                       "is_connected": connection.is_connected},
+        "message": message,
     }
 
 

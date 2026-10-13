@@ -27,6 +27,9 @@ class GatewayConnection:
     hostname: str
     port: int
     gateway_session_id: Optional[str] = None
+    # True only once a real RDP connection exists. The placeholder gateway
+    # never connects, so sessions it prepares must not be reported ACTIVE.
+    is_connected: bool = False
 
 
 class RDPGateway(Protocol):
