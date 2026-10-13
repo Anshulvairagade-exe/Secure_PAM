@@ -14,6 +14,7 @@ reference at an arbitrary location in OpenBao.
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
+from pydantic import BaseModel
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -117,3 +118,71 @@ async def deactivate_credential_ref(
         metadata={"vault_ref_id": str(ref.id), "secret_reference": ref.vault_path},
     )
     await db.commit()
+
+
+class CredentialRefCheck(BaseModel):
+    """Whether the referenced secret can be read by the backend's own
+    restricted identity. Never contains the secret."""
+    status: str  # ok, secret_not_found, access_denied, unavailable, malformed, no_reference
+    message: str
+
+
+_CHECK_RESULTS = {
+    "ok": "The secret exists and the gateway can read it.",
+    "secret_not_found": "No secret exists at this reference. Store the secret in OpenBao at this path.",
+    "access_denied": "The gateway's secret-store identity is not permitted to read this path.",
+    "unavailable": "The secret store is unreachable.",
+    "malformed": "The secret exists but has no field for its secret type (for example, no password).",
+    "no_reference": "This asset has no active credential reference.",
+}
+
+
+@router.post("/{asset_id}/credential-ref/check", response_model=CredentialRefCheck)
+async def check_credential_ref(
+    asset_id: UUID,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(PermissionChecker("vault", "manage")),
+):
+    """Read the referenced secret with the backend's restricted runtime
+    identity and discard it, to report whether checkout would work."""
+    from app.secret_providers import (
+        MalformedSecretError,
+        SecretAccessDeniedError,
+        SecretNotFoundError,
+        SecretProviderError,
+        SecretProviderUnavailableError,
+        get_secret_provider,
+    )
+    from app.services.credential_service import SECRET_FIELDS
+
+    await _get_asset_or_404(db, asset_id)
+    ref = await _active_ref(db, asset_id)
+    if ref is None:
+        result = "no_reference"
+    else:
+        try:
+            record = await get_secret_provider().read_secret(ref.vault_path, version=ref.secret_version)
+            field = SECRET_FIELDS.get(ref.secret_type)
+            has_field = bool(field and isinstance(record.data.get(field), str) and record.data.get(field))
+            del record
+            result = "ok" if has_field else "malformed"
+        except SecretNotFoundError:
+            result = "secret_not_found"
+        except SecretAccessDeniedError:
+            result = "access_denied"
+        except SecretProviderUnavailableError:
+            result = "unavailable"
+        except MalformedSecretError:
+            result = "malformed"
+        except SecretProviderError:
+            result = "unavailable"
+
+    await write_audit_log(
+        db, actor=current_user, action="CREDENTIAL_REF_CHECKED", target_type="asset", target_id=str(asset_id),
+        source_ip=client_ip(request), result="SUCCESS" if result == "ok" else "FAILURE",
+        severity="INFO" if result == "ok" else "MEDIUM",
+        metadata={"result": result, "secret_reference": ref.vault_path if ref else None},
+    )
+    await db.commit()
+    return CredentialRefCheck(status=result, message=_CHECK_RESULTS[result])

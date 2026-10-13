@@ -15,6 +15,7 @@ Authorization:
   The response never contains a credential or a filesystem path.
 """
 
+import logging
 import uuid
 from datetime import datetime, timezone
 from typing import List, Optional
@@ -42,7 +43,10 @@ from app.services.credential_service import (
     CredentialUnavailable,
 )
 from app.services.jit_service import JITService
+from app.services.credential_errors import credential_denied_error, credential_unavailable_error, failure_message
 from app.services.rdp_gateway import GatewayError, RDPGateway, get_rdp_gateway
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/sessions", tags=["Sessions"])
 
@@ -78,6 +82,9 @@ class SessionResponse(BaseModel):
     recording_id: Optional[uuid.UUID]
     asset_name: Optional[str] = None
     recording_status: Optional[str] = None
+    # FAILED sessions: the stable reason code and a safe, actionable message.
+    failure_reason: Optional[str] = None
+    failure_message: Optional[str] = None
 
 
 def _can_view_all(user: User) -> bool:
@@ -138,6 +145,16 @@ async def list_sessions(
         if item.recording_id:
             recording = await db.get(Recording, item.recording_id)
             item.recording_status = recording.status if recording else None
+        if item.status == "FAILED":
+            event = (await db.execute(
+                select(SessionEvent)
+                .where(SessionEvent.session_id == item.id)
+                .order_by(SessionEvent.timestamp.desc())
+            )).scalars().first()
+            reason = (event.details or {}).get("reason") if event else None
+            if reason:
+                item.failure_reason = reason
+                item.failure_message = failure_message(reason)
     return page
 
 
@@ -250,11 +267,12 @@ async def launch_rdp_session(
     except CredentialAccessDenied as exc:
         await _fail_launch(db, session=session, recording=recording, actor=current_user,
                            reason=exc.reason, source_ip=source_ip)
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "Credential access was denied for this session.")
+        raise credential_denied_error(exc.reason)
     except CredentialUnavailable as exc:
         await _fail_launch(db, session=session, recording=recording, actor=current_user,
                            reason=exc.reason, source_ip=source_ip)
-        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "Credential provider unavailable; session not started.")
+        logger.warning("rdp_launch_failed session=%s asset=%s reason=%s", session.id, asset.id, exc.reason)
+        raise credential_unavailable_error(exc.reason)
     except GatewayError:
         await _fail_launch(db, session=session, recording=recording, actor=current_user,
                            reason="GATEWAY_ERROR", source_ip=source_ip)

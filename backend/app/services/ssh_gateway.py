@@ -37,7 +37,12 @@ class SSHGateway(Protocol):
 
 
 class SSHError(Exception):
-    """The SSH gateway could not prepare or establish the connection."""
+    """The gateway could not prepare or connect the session. `code` is a
+    stable, non-secret reason (see app/services/credential_errors.py)."""
+
+    def __init__(self, message: str = "SSH gateway error", code: str = "GATEWAY_ERROR"):
+        super().__init__(message)
+        self.code = code
 
 
 class PendingSSHGateway:

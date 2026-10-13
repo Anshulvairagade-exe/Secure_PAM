@@ -52,6 +52,12 @@ from app.services.credential_service import (
 )
 from app.services.jit_service import JITService
 from app.services.ssh_gateway import SSHError, SSHGateway, get_ssh_gateway
+from app.services.credential_errors import (
+    credential_denied_error,
+    credential_unavailable_error,
+    failure_message,
+    gateway_error,
+)
 from app.services.terminal_recorder import RecordingError, TerminalRecorder, storage_writable
 from app.services.ssh_terminal_gateway import (
     AsyncSSHTerminalGateway,
@@ -294,7 +300,8 @@ async def launch_ssh_session(
                 reason=exc.reason,
                 source_ip=source_ip,
             )
-            raise HTTPException(status.HTTP_403_FORBIDDEN, "Credential access was denied for this session.")
+            logger.warning("ssh_launch_failed session=%s asset=%s reason=%s", session.id, asset.id, exc.reason)
+            raise credential_denied_error(exc.reason)
         except CredentialUnavailable as exc:
             await _fail_launch(
                 db,
@@ -304,19 +311,19 @@ async def launch_ssh_session(
                 reason=exc.reason,
                 source_ip=source_ip,
             )
-            raise HTTPException(
-                status.HTTP_503_SERVICE_UNAVAILABLE, "Credential provider unavailable; session not started."
-            )
-        except SSHError:
+            logger.warning("ssh_launch_failed session=%s asset=%s reason=%s", session.id, asset.id, exc.reason)
+            raise credential_unavailable_error(exc.reason)
+        except SSHError as exc:
             await _fail_launch(
                 db,
                 session=session,
                 recording=recording,
                 actor=current_user,
-                reason="GATEWAY_ERROR",
+                reason=exc.code,
                 source_ip=source_ip,
             )
-            raise HTTPException(status.HTTP_502_BAD_GATEWAY, "SSH gateway could not start the session.")
+            logger.warning("ssh_launch_failed session=%s asset=%s reason=%s", session.id, asset.id, exc.code)
+            raise gateway_error(exc.code)
 
         now = datetime.now(timezone.utc)
         session.gateway_session_id = connection.gateway_session_id
@@ -644,10 +651,22 @@ async def ssh_terminal_websocket(
                     await terminal_gateway.prepare(session=session, asset=asset, credential=credential)
                 connection_acquired = True
                 live_conn = terminal_gateway.get_live_connection(session.id)
-            except Exception as exc:
-                logger.error("Failed to establish live SSH connection for session %s: %s", session.id, exc)
-                await _close_session_in_db(session.id, status_val="FAILED", reason="SSH_HANDSHAKE_FAILED")
-                await websocket.close(code=status.WS_1011_INTERNAL_ERROR, reason="SSH connection failed")
+            except (CredentialAccessDenied, CredentialUnavailable, SSHError, Exception) as exc:
+                if isinstance(exc, (CredentialAccessDenied, CredentialUnavailable)):
+                    reason = exc.reason
+                elif isinstance(exc, SSHError):
+                    reason = exc.code
+                else:
+                    reason = "GATEWAY_ERROR"
+                # Sanitized: reason codes and ids only, never secrets or tokens.
+                logger.warning("ssh_connect_failed session=%s asset=%s reason=%s error=%s",
+                               session.id, asset.id, reason, type(exc).__name__)
+                await _close_session_in_db(session.id, status_val="FAILED", reason=reason)
+                try:
+                    await websocket.send_text(json.dumps({"type": "error", "message": failure_message(reason)}))
+                except Exception:
+                    pass
+                await websocket.close(code=status.WS_1011_INTERNAL_ERROR, reason=reason[:120])
                 return
 
         if live_conn is None or live_conn.is_closed:

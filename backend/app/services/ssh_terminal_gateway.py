@@ -113,14 +113,14 @@ class AsyncSSHTerminalGateway:
         - Cleans up and closes any partial socket on failure or cancellation.
         """
         if credential.is_wiped:
-            raise SSHError("Credential was wiped prior to SSH handshake.")
+            raise SSHError("Credential was wiped prior to SSH handshake.", code="CREDENTIAL_UNSUPPORTED")
 
         # 1. Resolve trusted host keys fail-closed
         try:
             trusted_known_hosts = await self._host_key_validator.get_trusted_known_hosts_for_asset(asset)
         except SSHHostKeyError as exc:
             logger.warning("SSH host-key verification rejected target %s: %s", asset.name, exc)
-            raise SSHError(f"Host-key verification failed: {exc}") from exc
+            raise SSHError(f"Host-key verification failed: {exc}", code="HOST_KEY_UNTRUSTED") from exc
 
         # 2. Extract and scope credential secrets strictly to the handshake
         username = credential.username
@@ -136,11 +136,11 @@ class AsyncSSHTerminalGateway:
                 try:
                     client_keys = [asyncssh.import_private_key(raw_secret)]
                 except Exception as exc:
-                    raise SSHError(f"Failed to import SSH client private key: {exc}") from exc
+                    raise SSHError(f"Failed to import SSH client private key: {type(exc).__name__}", code="CREDENTIAL_UNSUPPORTED") from exc
             else:
-                raise SSHError(f"Unsupported secret type for SSH: {secret_type}")
+                raise SSHError(f"Unsupported secret type for SSH: {secret_type}", code="CREDENTIAL_UNSUPPORTED")
         except RuntimeError as exc:
-            raise SSHError(f"Unable to read credential for handshake: {exc}") from exc
+            raise SSHError(f"Unable to read credential for handshake: {exc}", code="CREDENTIAL_UNSUPPORTED") from exc
 
         # 3. Establish upstream connection using AsyncSSH
         conn: Optional[asyncssh.SSHClientConnection] = None
@@ -165,7 +165,7 @@ class AsyncSSHTerminalGateway:
                     await conn.wait_closed()
                 except Exception:
                     pass
-            raise SSHError(f"Host key verification failed: {exc}") from exc
+            raise SSHError(f"Host key verification failed: {exc}", code="HOST_KEY_UNTRUSTED") from exc
         except asyncssh.PermissionDenied as exc:
             logger.warning("SSH authentication denied for %s@%s: %s", username, asset.hostname, exc)
             if conn is not None:
@@ -174,7 +174,7 @@ class AsyncSSHTerminalGateway:
                     await conn.wait_closed()
                 except Exception:
                     pass
-            raise SSHError(f"SSH authentication failed: {exc}") from exc
+            raise SSHError(f"SSH authentication failed: {exc}", code="TARGET_AUTH_FAILED") from exc
         except asyncio.CancelledError:
             logger.info("SSH connection cancelled for %s", asset.hostname)
             if conn is not None:
@@ -192,7 +192,7 @@ class AsyncSSHTerminalGateway:
                     await conn.wait_closed()
                 except Exception:
                     pass
-            raise SSHError(f"SSH connection failed: {exc}") from exc
+            raise SSHError(f"SSH connection failed: {exc}", code="TARGET_UNREACHABLE") from exc
         except BaseException as exc:
             logger.error("Unexpected error during SSH connection to %s: %s", asset.hostname, exc)
             if conn is not None:
