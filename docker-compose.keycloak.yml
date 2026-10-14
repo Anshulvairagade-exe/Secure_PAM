@@ -1,0 +1,19 @@
+# Keycloak overlay: the custom OTP-audit provider image + first-boot realm import.
+# Integrates SecurePAM_keycloak_Package (Dockerfile.keycloak / docker-compose.keycloak.override.yml)
+# using this repository's paths. Service, network and volume names are those of docker-compose.yml.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.keycloak.yml --profile lab config
+#   docker compose -f docker-compose.yml -f docker-compose.keycloak.yml --profile lab up -d --build keycloak
+#
+# The realm import only applies to a NEW Keycloak database: an existing `securepam` realm is never
+# overwritten (Keycloak skips realms that already exist). Local development only: start-dev, HTTP,
+# published on 127.0.0.1 only.
+services:
+  keycloak:
+    image: securepam-keycloak-mfa-audit:24.0
+    build:
+      context: .
+      dockerfile: infrastructure/keycloak/Dockerfile
+    command: ["start-dev", "--import-realm"]
+    volumes:
+      - ./infrastructure/keycloak/realm-import:/opt/keycloak/data/import:ro

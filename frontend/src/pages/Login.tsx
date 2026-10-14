@@ -64,10 +64,6 @@ export default function Login() {
             </p>
           ) : devMode ? (
             <form onSubmit={submitDevLogin} className="space-y-3">
-              <p className="rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-300">
-                Development sign-in: this backend runs with DEV_MODE and the seeded
-                development accounts. Production deployments use Keycloak.
-              </p>
               <input
                 className="input"
                 placeholder="Username"

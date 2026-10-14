@@ -1,0 +1,12 @@
+# Copy to terraform.tfvars (git-ignored). No secrets here.
+aws_region                 = "<region>"
+vpc_id                     = "<vpc-...>"
+private_subnet_ids         = ["<subnet-a>", "<subnet-b>"]
+public_alb                 = false
+client_cidr_blocks         = ["<VPN/office CIDR>"]
+admin_cidr_blocks          = ["<admin VPN CIDR>", "<backend NAT egress /32 if outside VPC>"]
+backend_security_group_ids = ["<sg-of-securepam-backend>"]
+acm_certificate_arn        = "<arn:aws:acm:...:certificate/...>"
+route53_zone_id            = "<zone>"
+keycloak_hostname          = "<auth.ops.example.com>"
+image_tag                  = "<git-sha>"
