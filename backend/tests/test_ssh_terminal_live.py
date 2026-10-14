@@ -814,6 +814,19 @@ async def test_required_recording_captures_real_artifact(db_session, operator_to
             actions = [a.action for a in (await db.execute(
                 select(AuditLog).where(AuditLog.session_id == uuid.UUID(session_id)))).scalars().all()]
         assert "RECORDING_STARTED" in actions and "RECORDING_COMPLETED" in actions
+
+        # The activity transcript is a separate, hashed artifact derived from the same stream.
+        from app.services.command_transcript import transcript_path
+        meta = rec.metadata_["transcript"]
+        tpath = transcript_path(rec.file_path)
+        assert (tpath.stat().st_mode & 0o777) == 0o600
+        assert hashlib.sha256(tpath.read_bytes()).hexdigest() == meta["sha256"]
+        doc = json.loads(tpath.read_text())
+        by_input = {e["input"]: e for e in doc["events"]}
+        assert "recording-marker" in by_input and "exit" in by_input
+        assert "recording-marker" in by_input["recording-marker"]["output"] or by_input["recording-marker"]["output"] == ""
+        assert doc["execution_verified"] is False and CANARY not in tpath.read_text()
+        assert hashlib.sha256(artifact.read_bytes()).hexdigest() == rec.file_hash  # evidence untouched
     finally:
         app.dependency_overrides.pop(get_terminal_gateway, None)
         server.stop()
@@ -942,7 +955,7 @@ async def test_admin_terminate_closes_live_ssh_terminal(db_session, operator_tok
             # The monitor re-reads the session each second, on whichever worker holds the terminal.
             assert await _wait_closed(gateway, session_id), "terminate left the SSH connection open"
         async with async_session_factory() as db:
-            assert (await db.get(Session, session_id)).status == "COMPLETED"
+            assert (await db.get(Session, session_id)).status == "TERMINATED"  # ended by an administrator, not by its owner
     finally:
         app.dependency_overrides.pop(get_terminal_gateway, None)
         server.stop()

@@ -21,7 +21,8 @@ from datetime import datetime, timezone
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
-from pydantic import BaseModel, ConfigDict
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -43,15 +44,23 @@ from app.services.credential_service import (
     CredentialUnavailable,
 )
 from app.services.jit_service import JITService
-from app.services.credential_errors import credential_denied_error, credential_unavailable_error, failure_message
-from app.services.rdp_gateway import GatewayError, RDPGateway, get_rdp_gateway
+from app.services.credential_errors import (
+    credential_denied_error, credential_unavailable_error, failure_message, gateway_error,
+)
+from app.services.browser_isolation import get_browser_isolation_gateway
+from app.services.rdp_recording import session_recording_file
+from app.services.session_policy import acquire_slot
+from app.services.ssh_ticket import SSHTicketService, get_ssh_ticket_service
+from app.services.session_termination import terminate_session as terminate_session_service
+from app.services.ssh_terminal_gateway import AsyncSSHTerminalGateway, get_terminal_gateway
+from app.services.rdp_gateway import GatewayError, RDPGateway, get_rdp_gateway, rdp_recording_writable
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/sessions", tags=["Sessions"])
 
-LIVE_STATUSES = {"CREATED", "STARTING", "ACTIVE"}
-_SESSION_STATUSES = {"CREATED", "STARTING", "ACTIVE", "TERMINATING", "COMPLETED", "FAILED", "EXPIRED"}
+LIVE_STATUSES = {"CREATED", "STARTING", "ACTIVE", "TERMINATING"}
+_SESSION_STATUSES = {"CREATED", "STARTING", "ACTIVE", "TERMINATING", "TERMINATED", "COMPLETED", "FAILED", "EXPIRED"}
 _SORTABLE_COLUMNS = {"created_at", "start_time", "end_time", "status", "protocol", "session_number"}
 _jit = JITService()
 
@@ -80,6 +89,9 @@ class SessionResponse(BaseModel):
     start_time: Optional[datetime]
     end_time: Optional[datetime]
     recording_id: Optional[uuid.UUID]
+    # The grant that authorized this session — the admin UI uses it to
+    # revoke access (IDs only, never credentials).
+    jit_grant_id: Optional[uuid.UUID] = None
     asset_name: Optional[str] = None
     recording_status: Optional[str] = None
     # FAILED sessions: the stable reason code and a safe, actionable message.
@@ -97,6 +109,26 @@ async def _get_visible_session_or_404(db: AsyncSession, session_id: uuid.UUID, u
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Session not found")
     return session
 
+
+
+async def _enrich_session(db: AsyncSession, item: "SessionResponse") -> None:
+    """Joined, display-only fields shared by the list and detail endpoints."""
+    if item.asset_id:
+        asset = await db.get(Asset, item.asset_id)
+        item.asset_name = asset.name if asset else None
+    if item.recording_id:
+        recording = await db.get(Recording, item.recording_id)
+        item.recording_status = recording.status if recording else None
+    if item.status == "FAILED":
+        event = (await db.execute(
+            select(SessionEvent)
+            .where(SessionEvent.session_id == item.id)
+            .order_by(SessionEvent.timestamp.desc())
+        )).scalars().first()
+        reason = (event.details or {}).get("reason") if event else None
+        if reason:
+            item.failure_reason = reason
+            item.failure_message = failure_message(reason)
 
 
 @router.get("/", response_model=PaginatedResponse[SessionResponse])
@@ -139,22 +171,7 @@ async def list_sessions(
 
     page = await paginate(db, query, pagination, schema=SessionResponse)
     for item in page.items:
-        if item.asset_id:
-            asset = await db.get(Asset, item.asset_id)
-            item.asset_name = asset.name if asset else None
-        if item.recording_id:
-            recording = await db.get(Recording, item.recording_id)
-            item.recording_status = recording.status if recording else None
-        if item.status == "FAILED":
-            event = (await db.execute(
-                select(SessionEvent)
-                .where(SessionEvent.session_id == item.id)
-                .order_by(SessionEvent.timestamp.desc())
-            )).scalars().first()
-            reason = (event.details or {}).get("reason") if event else None
-            if reason:
-                item.failure_reason = reason
-                item.failure_message = failure_message(reason)
+        await _enrich_session(db, item)
     return page
 
 
@@ -166,7 +183,9 @@ async def get_session(
     current_user: User = Depends(PermissionChecker("sessions", "read", "read_own")),
 ):
     """Retrieve details for a single session."""
-    return await _get_visible_session_or_404(db, session_id, current_user)
+    item = SessionResponse.model_validate(await _get_visible_session_or_404(db, session_id, current_user))
+    await _enrich_session(db, item)
+    return item
 
 
 async def _fail_launch(
@@ -195,6 +214,7 @@ async def launch_rdp_session(
     current_user: User = Depends(PermissionChecker("sessions", "create")),
     credentials: CredentialService = Depends(get_credential_service),
     gateway: RDPGateway = Depends(get_rdp_gateway),
+    ticket_service: SSHTicketService = Depends(get_ssh_ticket_service),
 ):
     """
     Launch an RDP session via the gateway. The credential is checked out
@@ -238,6 +258,27 @@ async def launch_rdp_session(
     if grant is None:
         await deny("NO_VALID_JIT_GRANT", "No valid just-in-time grant for this request.")
 
+    # No gateway, no session: a row that nothing can connect or record would
+    # only masquerade as access. Refuse before any session or credential read.
+    deployed = getattr(gateway, "is_deployed", True)
+    if deployed and hasattr(gateway, "available"):
+        deployed = await gateway.available()  # a configured but unreachable guacd is not a gateway
+    if not deployed:
+        await write_audit_log(
+            db, actor=current_user, action="SESSION_LAUNCH_DENIED", target_type="asset", target_id=str(asset.id),
+            request_id=access_request.id, source_ip=source_ip, result="FAILURE", severity="MEDIUM",
+            metadata={"reason": "GATEWAY_UNAVAILABLE", "protocol": "RDP"},
+        )
+        await db.commit()
+        raise gateway_error("GATEWAY_UNAVAILABLE")
+
+    if (asset.recording_required or access_request.recording_required) and not rdp_recording_writable():
+        await deny("RECORDING_UNAVAILABLE",
+                   "This target requires session recording, but RDP recording storage is unavailable.")
+
+    await acquire_slot(db, current_user, protocol="RDP", source_ip=source_ip,
+                       request_id=access_request.id, asset_id=asset.id)
+
     session = Session(
         session_number=generate_session_number(), user_id=current_user.id, asset_id=asset.id,
         request_id=access_request.id, jit_grant_id=grant.id, protocol="RDP", status="STARTING",
@@ -250,7 +291,7 @@ async def launch_rdp_session(
     if asset.recording_required or access_request.recording_required:
         recording = Recording(
             session_id=session.id, recording_type="VIDEO", status="PENDING",
-            file_path=f"{settings.RECORDING_STORAGE_PATH}/session_{session.id}",
+            file_path=str(session_recording_file(session.id)),
         )
         db.add(recording)
         await db.flush()
@@ -283,21 +324,42 @@ async def launch_rdp_session(
 
     now = datetime.now(timezone.utc)
     session.gateway_session_id = connection.gateway_session_id
-    if connection.is_connected:
-        session.status = "ACTIVE"
-        session.start_time = now
-        if recording:
-            recording.status = "RECORDING"
-        event, message = "SESSION_STARTED", "RDP session connected through the SecurePAM gateway."
-    else:
-        # Placeholder gateway (no Guacamole yet): the credential was checked out
-        # and handed to the gateway, but no RDP connection exists. Report that
-        # truthfully instead of claiming a live, recorded session.
-        session.status = "STARTING"
-        event, message = "SESSION_PREPARED", (
-            "Session prepared and credential checked out, but the RDP gateway is not "
-            "connected yet (Guacamole integration pending). No RDP connection was made."
+    if not connection.is_connected:
+        # Prepared, not connected: the browser redeems its one-time ticket on the RDP WebSocket,
+        # which makes the real connection. Until then this is STARTING, never ACTIVE.
+        db.add(SessionEvent(session_id=session.id, event_type="SESSION_PREPARED", timestamp=now,
+                            details={"protocol": "RDP", "pending_connection": True}))
+        await write_audit_log(
+            db, actor=current_user, action="SESSION_PREPARED", target_type="asset", target_id=str(asset.id),
+            request_id=access_request.id, session_id=session.id, source_ip=source_ip, result="SUCCESS",
+            severity="INFO", metadata={"protocol": "RDP", "session_number": session.session_number,
+                                       "jit_grant_id": str(grant.id), "status": "STARTING"},
         )
+        await db.commit()
+        try:
+            ticket = await ticket_service.issue_ticket(
+                session_id=session.id, user_id=current_user.id, asset_id=asset.id,
+                access_request_id=access_request.id, jit_grant_id=grant.id, ttl_seconds=60,
+            )
+        except Exception:
+            await _fail_launch(db, session=session, recording=recording, actor=current_user,
+                               reason="TICKET_GENERATION_FAILED", source_ip=source_ip)
+            raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, "Failed to issue session connection ticket.")
+        return {
+            "session_id": str(session.id),
+            "session_number": session.session_number,
+            "status": "STARTING",
+            "recording_id": str(recording.id) if recording else None,
+            "ticket": ticket,
+            "ws_url": f"/api/v1/sessions/rdp/{session.id}/ws",
+            "connection": {"protocol": "rdp", "target_asset": asset.name, "is_connected": False},
+            "message": "Session prepared. The desktop connects when the browser redeems its one-time ticket.",
+        }
+    session.status = "ACTIVE"
+    session.start_time = now
+    if recording:
+        recording.status = "RECORDING"
+    event, message = "SESSION_STARTED", "RDP session connected through the SecurePAM gateway."
     db.add(SessionEvent(session_id=session.id, event_type=event, timestamp=now,
                         details={"protocol": "RDP", "recording": recording is not None}))
     await write_audit_log(
@@ -320,14 +382,25 @@ async def launch_rdp_session(
     }
 
 
+class TerminateBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    reason: Optional[str] = Field(None, max_length=300)
+
+
 @router.post("/{session_id}/terminate")
 async def terminate_session(
     session_id: uuid.UUID,
     request: Request,
+    body: Optional[TerminateBody] = None,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(PermissionChecker("sessions", "terminate", "read", "read_own")),
+    gateway: AsyncSSHTerminalGateway = Depends(get_terminal_gateway),
+    rdp_gateway: RDPGateway = Depends(get_rdp_gateway),
+    web_gateway=Depends(get_browser_isolation_gateway),
 ):
-    """Terminate a live session and finalize its recording and audit records."""
+    """Terminate a live session: close the real connection, settle the recording by what
+    exists, audit. An administrator ending someone else's session also revokes its JIT
+    grant (no reconnecting with it); an owner ending their own keeps the grant."""
     session = await _get_visible_session_or_404(db, session_id, current_user)
 
     is_owner = session.user_id == current_user.id
@@ -343,22 +416,13 @@ async def terminate_session(
     if session.status not in LIVE_STATUSES:
         raise HTTPException(status.HTTP_409_CONFLICT, f"Session is already {session.status}")
 
-    now = datetime.now(timezone.utc)
-    session.status = "COMPLETED"
-    session.end_time = now
-
-    if session.recording_id:
-        recording = await db.get(Recording, session.recording_id)
-        if recording and recording.status in ("PENDING", "RECORDING"):
-            recording.status = "COMPLETED"
-
-    db.add(SessionEvent(session_id=session.id, event_type="SESSION_TERMINATED", timestamp=now,
-                        details={"by_owner": is_owner}))
-    await write_audit_log(
-        db, actor=current_user, action="SESSION_TERMINATED", target_type="session", target_id=str(session.id),
-        request_id=session.request_id, session_id=session.id, source_ip=client_ip(request),
-        result="SUCCESS", severity="INFO", metadata={"by_owner": is_owner},
+    result = await terminate_session_service(
+        db, session, actor=current_user, source_ip=client_ip(request), gateway=gateway, rdp_gateway=rdp_gateway, web_gateway=web_gateway,
+        reason=body.reason if body else None, revoke_grant=not is_owner,
+        final_status="COMPLETED" if is_owner else "TERMINATED",
     )
-    await db.commit()
-
-    return {"message": "Session terminated successfully", "session_id": str(session_id)}
+    payload = {"message": "Session terminated successfully" if result.ok else "Session termination was incomplete",
+               "session_id": str(session_id), "complete": result.ok, "result": result.dict()}
+    if not result.ok:
+        return JSONResponse(payload, status_code=status.HTTP_207_MULTI_STATUS)
+    return payload

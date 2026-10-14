@@ -51,6 +51,7 @@ from app.services.credential_service import (
     CredentialUnavailable,
 )
 from app.services.jit_service import JITService
+from app.services.session_policy import acquire_slot
 from app.services.ssh_gateway import SSHError, SSHGateway, get_ssh_gateway
 from app.services.credential_errors import (
     credential_denied_error,
@@ -58,6 +59,7 @@ from app.services.credential_errors import (
     failure_message,
     gateway_error,
 )
+from app.services.command_transcript import TranscriptTracker, write_transcript
 from app.services.terminal_recorder import RecordingError, TerminalRecorder, storage_writable
 from app.services.ssh_terminal_gateway import (
     AsyncSSHTerminalGateway,
@@ -101,6 +103,7 @@ async def _finish_recording(
     actor_id: uuid.UUID,
     session_id: uuid.UUID,
     failure_reason: Optional[str] = None,
+    tracker: Optional[TranscriptTracker] = None,
 ) -> None:
     """Close the recorder and store the outcome. A recording is COMPLETED only
     when the recorder ran and its artifact was closed and hashed."""
@@ -126,8 +129,21 @@ async def _finish_recording(
             rec.file_hash = result.file_hash
             rec.duration_seconds = result.duration_seconds
             action, severity = "RECORDING_COMPLETED", "INFO"
+            transcript_meta = None
+            if tracker is not None:
+                # Derived, separate artifact; the original recording stays untouched.
+                # A failure here must not invalidate the recording itself.
+                try:
+                    session_row = await db.get(Session, session_id)
+                    transcript_meta = write_transcript(
+                        rec.file_path, session_number=session_row.session_number if session_row else "",
+                        events=tracker.events(), truncated=tracker.truncated)
+                    rec.metadata_ = {**(rec.metadata_ or {}), "transcript": transcript_meta}
+                except Exception as exc:
+                    logger.error("Transcript could not be written for %s: %s", session_id, type(exc).__name__)
             details = {"sha256": result.file_hash, "file_size": result.file_size,
-                       "duration_seconds": result.duration_seconds, "events": result.event_count}
+                       "duration_seconds": result.duration_seconds, "events": result.event_count,
+                       "transcript_events": transcript_meta["events"] if transcript_meta else None}
         else:
             rec.status = "FAILED"
             action, severity = "RECORDING_FAILED", "HIGH"
@@ -244,6 +260,11 @@ async def launch_ssh_session(
     )
     if grant is None:
         await deny("NO_VALID_JIT_GRANT", "No valid just-in-time grant for this request.")
+
+    # Atomic per-user concurrency check; holds the user-row lock until the
+    # Session row below is committed. Never based on client-supplied values.
+    await acquire_slot(db, current_user, protocol="SSH", source_ip=source_ip,
+                       request_id=access_request.id, asset_id=asset.id)
 
     session = Session(
         session_number=generate_session_number(),
@@ -491,7 +512,9 @@ async def _close_session_in_db(
     try:
         async with async_session_factory() as db:
             session = await db.get(Session, session_id)
-            if session and session.status not in ("COMPLETED", "FAILED", "EXPIRED"):
+            # TERMINATING means the termination service owns the final state (it settles the recording and
+            # sets TERMINATED/COMPLETED itself); writing here would race with it.
+            if session and session.status not in ("COMPLETED", "FAILED", "EXPIRED", "TERMINATED", "TERMINATING"):
                 session.status = status_val
                 session.end_time = now
                 if session.recording_id:
@@ -689,6 +712,7 @@ async def ssh_terminal_websocket(
     final_status = "COMPLETED"
     final_reason = "SESSION_TERMINATED"
     recorder: Optional[TerminalRecorder] = None
+    tracker: Optional[TranscriptTracker] = None
     recording_failure: Optional[str] = None
 
     try:
@@ -699,6 +723,7 @@ async def ssh_terminal_websocket(
                     raise RecordingError("Recording has no artifact path")
                 recorder = TerminalRecorder(recording_file_path)
                 recorder.start(width=DEFAULT_COLS, height=DEFAULT_ROWS, title=session_number)
+                tracker = TranscriptTracker(recorder.elapsed)
             except RecordingError as exc:
                 logger.error("Recording could not start for session %s: %s", session_id, exc)
                 recording_failure = "RECORDING_START_FAILED"
@@ -771,6 +796,8 @@ async def ssh_terminal_websocket(
                     if recorder is not None:
                         # Record before display: nothing reaches the operator unrecorded.
                         recorder.output(chunk)
+                    if tracker is not None:
+                        tracker.output(chunk)
                     await websocket.send_text(json.dumps({"type": "output", "data": chunk}))
             except (asyncio.CancelledError, WebSocketDisconnect):
                 pass
@@ -797,6 +824,8 @@ async def ssh_terminal_websocket(
                             if msg_type == "input":
                                 raw_input = data.get("data", "")
                                 if isinstance(raw_input, str):
+                                    if tracker is not None:
+                                        tracker.input(raw_input)
                                     proc.stdin.write(raw_input)
                                 continue
                             elif msg_type == "resize":
@@ -819,6 +848,8 @@ async def ssh_terminal_websocket(
                             pass
 
                     # Fallback: treat as raw text input
+                    if tracker is not None:
+                        tracker.input(msg)
                     proc.stdin.write(msg)
             except (asyncio.CancelledError, WebSocketDisconnect):
                 pass
@@ -975,7 +1006,7 @@ async def ssh_terminal_websocket(
                 try:
                     await _finish_recording(
                         session_recording_id, recorder=recorder, actor_id=session_user_id,
-                        session_id=session_id, failure_reason=recording_failure,
+                        session_id=session_id, failure_reason=recording_failure, tracker=tracker,
                     )
                 except Exception as exc:
                     logger.error("Error finalizing recording for %s: %s", session_id, exc)

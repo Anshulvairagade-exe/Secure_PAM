@@ -39,15 +39,19 @@ async def _keycloak_mfa_sync_loop() -> None:
 
     while True:
         try:
+            stats: dict = {}
             async with async_session_factory() as db:
                 imported = await sync_keycloak_mfa_failures(
                     db,
                     lookback_hours=settings.KEYCLOAK_MFA_SYNC_LOOKBACK_HOURS,
+                    stats=stats,
                 )
 
+            # fetched / otp_failures / already_imported make a zero import explainable.
             logger.info(
                 "keycloak_mfa_sync_completed",
                 imported_count=imported,
+                **{k: v for k, v in stats.items() if k != "imported"},
             )
         except asyncio.CancelledError:
             raise
@@ -55,6 +59,28 @@ async def _keycloak_mfa_sync_loop() -> None:
             logger.exception("keycloak_mfa_sync_failed")
 
         await asyncio.sleep(interval)
+
+async def _recording_reconcile_loop() -> None:
+    """Fail recordings that no gateway will finalize (see app.services.recording_reconciler)."""
+    from app.services import risk_detector
+    from app.services.recording_reconciler import reconcile_stale_recordings
+
+    tick = 0
+    while True:
+        try:
+            async with async_session_factory() as db:
+                failed = await reconcile_stale_recordings(db)
+            if failed:
+                logger.warning("recordings_reconciled_failed", count=len(failed))
+            if tick % 5 == 0:  # Risk Centre findings every 5 minutes
+                async with async_session_factory() as db:
+                    logger.info("risk_evaluated", **(await risk_detector.evaluate(db)))
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("background_maintenance_failed")
+        tick += 1
+        await asyncio.sleep(60)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -85,10 +111,17 @@ async def lifespan(app: FastAPI):
     ):
         mfa_sync_task = asyncio.create_task(_keycloak_mfa_sync_loop())
         logger.info("keycloak_mfa_sync_started")
+    reconcile_task = None
+    if settings.ENVIRONMENT != "test":
+        reconcile_task = asyncio.create_task(_recording_reconcile_loop())
     app.state.rate_limiter = RedisRateLimiter(settings.REDIS_URL)
     try:
         yield
     finally:
+        if reconcile_task is not None:
+            reconcile_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await reconcile_task
         if mfa_sync_task is not None:
             mfa_sync_task.cancel()
             with suppress(asyncio.CancelledError):
@@ -271,7 +304,8 @@ async def security_headers_middleware(request: Request, call_next):
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
     """Pydantic/FastAPI request validation failures — 422."""
-    logger.info("validation_failed", errors=exc.errors())
+    # Never log "input"/"ctx": they carry the submitted value (e.g. a rejected password).
+    logger.info("validation_failed", errors=[{"loc": e.get("loc"), "type": e.get("type")} for e in exc.errors()])
     return JSONResponse(
         status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
         content={

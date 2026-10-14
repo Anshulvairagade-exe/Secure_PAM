@@ -1,25 +1,16 @@
 import { useEffect, useState } from 'react';
 import { Link } from 'react-router-dom';
-import { useMutation, useQueries, useQuery, useQueryClient } from '@tanstack/react-query';
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { MonitorPlay, Plus, TerminalSquare } from 'lucide-react';
-import { accessRequestsApi, assetsApi, sessionsApi } from '@/api';
+import { accessRequestsApi, applicationsApi, assetsApi, sessionsApi } from '@/api';
 import { getApiErrorMessage } from '@/api/errors';
 import { EmptyState, ErrorBanner, Skeleton } from '@/components/Feedback';
 import SshTerminal from '@/components/SshTerminal';
+import RdpClient from '@/components/RdpClient';
+import WebClient from '@/components/WebClient';
 import { useAuth } from '@/hooks/useAuth';
 import type { AccessRequest, Asset, Session, SSHLaunchResponse } from '@/types';
-
-const LIVE = new Set(['CREATED', 'STARTING', 'ACTIVE']);
-
-const STATUS_BADGE: Record<string, string> = {
-  STARTING: 'badge-warning',
-  ACTIVE: 'badge-success',
-  COMPLETED: 'badge-neutral',
-  EXPIRED: 'badge-neutral',
-  FAILED: 'badge-danger',
-  CREATED: 'badge-neutral',
-  TERMINATING: 'badge-warning',
-};
+import { LIVE_SESSION_STATUSES, SESSION_STATUS_BADGE } from '@/utils/sessionStatus';
 
 const RECORDING_BADGE: Record<string, string> = {
   RECORDING: 'badge-danger',
@@ -39,15 +30,16 @@ function elapsed(start?: string, end?: string, now = Date.now()): string {
 
 /** Why a protocol cannot be launched in this deployment, or null when it can. */
 export function gatewayUnavailableReason(protocol: string): string | null {
-  if (protocol === 'SSH') return null;
-  if (protocol === 'RDP') return 'RDP gateway (Guacamole) is not deployed; RDP sessions cannot connect.';
+  // SSH, RDP and web (isolated browser) launch through a gateway; if one is down the launch is refused
+  // with the reason, so nothing is pre-judged here.
+  if (['SSH', 'RDP', 'HTTP', 'HTTPS'].includes(protocol)) return null;
   return 'Web gateway is not deployed; web sessions cannot connect.';
 }
 
 export default function Sessions() {
   const { user } = useAuth();
   const queryClient = useQueryClient();
-  const [live, setLive] = useState<SSHLaunchResponse | null>(null);
+  const [live, setLive] = useState<(SSHLaunchResponse & { protocol: string }) | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
   const [now, setNow] = useState(Date.now());
 
@@ -63,23 +55,24 @@ export default function Sessions() {
   });
   const activeRequests = useQuery({
     queryKey: ['access-requests', { status: 'ACTIVE' }],
-    queryFn: () => accessRequestsApi.list({ page: 1, page_size: 50, status: 'ACTIVE' }),
+    // Newest first, so a just-approved request is never pushed off the first page by older ones.
+    queryFn: () => accessRequestsApi.list({ page: 1, page_size: 50, status: 'ACTIVE', sort_by: 'created_at', sort_order: 'desc' }),
   });
   const assets = useQuery({
     queryKey: ['assets', { page_size: 100 }],
     queryFn: () => assetsApi.list({ page: 1, page_size: 100 }),
   });
-  // The grant (status, expiry) is only on the request detail.
-  const details = useQueries({
-    queries: (activeRequests.data?.items ?? [])
-      .filter((r) => r.user_id === user?.id)
-      .map((r) => ({ queryKey: ['access-request', r.id], queryFn: () => accessRequestsApi.get(r.id) })),
-  });
-
   const assetById = new Map<string, Asset>((assets.data?.items ?? []).map((a) => [a.id, a]));
-  const eligible: AccessRequest[] = details
-    .map((d) => d.data)
-    .filter((r): r is AccessRequest => !!r && r.status === 'ACTIVE' && r.jit_grant?.status === 'ACTIVE');
+  const applications = useQuery({
+    queryKey: ['applications', { page_size: 100 }],
+    queryFn: () => applicationsApi.list({ page: 1, page_size: 100 }),
+  });
+  const appNameById = new Map<string, string>((applications.data?.items ?? []).map((a) => [a.id, a.name]));
+  // The list carries each request's grant summary, so no per-request calls are needed (they used to
+  // exhaust the API rate limit for operators with many requests, blocking the launch itself).
+  const eligible: AccessRequest[] = (activeRequests.data?.items ?? []).filter(
+    (r) => r.user_id === user?.id && r.status === 'ACTIVE' && r.jit_grant?.status === 'ACTIVE',
+  );
 
   const refresh = () => {
     void queryClient.invalidateQueries({ queryKey: ['sessions'] });
@@ -87,7 +80,14 @@ export default function Sessions() {
   };
 
   const launch = useMutation({
-    mutationFn: (req: AccessRequest) => sessionsApi.launchSSH(req.id, req.asset_id!),
+    mutationFn: async (req: AccessRequest) => ({
+      ...(req.protocol === 'RDP'
+        ? await sessionsApi.launchRDP(req.id, req.asset_id!)
+        : req.protocol === 'HTTP' || req.protocol === 'HTTPS'
+          ? await sessionsApi.launchWeb(req.id, req.application_id!)
+          : await sessionsApi.launchSSH(req.id, req.asset_id!)),
+      protocol: req.protocol,
+    }),
     onSuccess: (data) => { setActionError(null); setLive(data); refresh(); },
     onError: (error) => setActionError(getApiErrorMessage(error, 'The session could not be launched.')),
   });
@@ -114,7 +114,7 @@ export default function Sessions() {
 
       <section className="card p-5">
         <h2 className="mb-3 text-sm font-semibold text-gray-200">Ready to connect</h2>
-        {activeRequests.isLoading || details.some((d) => d.isLoading) ? (
+        {activeRequests.isLoading ? (
           <Skeleton className="h-12" />
         ) : eligible.length === 0 ? (
           <div className="flex items-center justify-between gap-4 text-sm text-gray-500">
@@ -129,7 +129,10 @@ export default function Sessions() {
               return (
                 <li key={req.id} className="flex items-center justify-between gap-4 py-3">
                   <div className="min-w-0">
-                    <p className="font-medium text-gray-200">{asset?.name ?? 'Target'} · {req.protocol}</p>
+                    <p className="font-medium text-gray-200">
+                      {asset?.name ?? (req.application_id ? appNameById.get(req.application_id) : undefined) ?? 'Target'} · {req.protocol}
+                      {req.application_id && <span className="ml-2 text-xs text-gray-500">isolated browser</span>}
+                    </p>
                     <p className="text-xs text-gray-500">
                       {req.request_number} · grant expires {new Date(req.jit_grant!.expires_at).toLocaleTimeString()}
                     </p>
@@ -142,7 +145,8 @@ export default function Sessions() {
                       disabled={launch.isPending || !!live}
                       onClick={() => launch.mutate(req)}
                     >
-                      <TerminalSquare size={16} /> {launch.isPending ? 'Launching...' : 'Connect'}
+                      {req.protocol === 'RDP' ? <MonitorPlay size={16} /> : <TerminalSquare size={16} />}{' '}
+                      {launch.isPending ? 'Launching...' : 'Connect'}
                     </button>
                   )}
                 </li>
@@ -171,14 +175,34 @@ export default function Sessions() {
               </button>
             </div>
           </div>
-          <SshTerminal
-            key={live.session_id}
-            sessionId={live.session_id}
-            sessionNumber={live.session_number}
-            ticket={live.ticket}
-            username={user.username}
-            onStateChange={(state) => { if (state === 'closed' || state === 'error') refresh(); }}
-          />
+          {live.protocol === 'HTTP' || live.protocol === 'HTTPS' ? (
+            <WebClient
+              key={live.session_id}
+              sessionId={live.session_id}
+              sessionNumber={live.session_number}
+              ticket={live.ticket}
+              username={user.username}
+              onStateChange={(state) => { if (state === 'closed' || state === 'error') refresh(); }}
+            />
+          ) : live.protocol === 'RDP' ? (
+            <RdpClient
+              key={live.session_id}
+              sessionId={live.session_id}
+              sessionNumber={live.session_number}
+              ticket={live.ticket}
+              username={user.username}
+              onStateChange={(state) => { if (state === 'closed' || state === 'error') refresh(); }}
+            />
+          ) : (
+            <SshTerminal
+              key={live.session_id}
+              sessionId={live.session_id}
+              sessionNumber={live.session_number}
+              ticket={live.ticket}
+              username={user.username}
+              onStateChange={(state) => { if (state === 'closed' || state === 'error') refresh(); }}
+            />
+          )}
         </section>
       )}
 
@@ -204,7 +228,7 @@ export default function Sessions() {
                     <td className="text-gray-300">{s.asset_name ?? '—'}</td>
                     <td className="text-gray-400">{s.protocol}</td>
                     <td>
-                      <span className={STATUS_BADGE[s.status] ?? 'badge-neutral'}>{s.status}</span>
+                      <span className={SESSION_STATUS_BADGE[s.status] ?? 'badge-neutral'}>{s.status}</span>
                       {s.status === 'STARTING' && live?.session_id !== s.id && (
                         <span className="ml-2 text-xs text-gray-500">not connected</span>
                       )}
@@ -214,10 +238,12 @@ export default function Sessions() {
                     <td>
                       {s.recording_status
                         ? <span className={RECORDING_BADGE[s.recording_status] ?? 'badge-neutral'}>{s.recording_status}</span>
-                        : <span className="text-xs text-gray-500">not required</span>}
+                        : s.protocol === 'HTTP' || s.protocol === 'HTTPS'
+                          ? <span className="text-xs text-gray-500" title="Isolated-browser sessions are not screen-recorded; their launch, egress denials and end are in the audit log">unavailable · events only</span>
+                          : <span className="text-xs text-gray-500">not required</span>}
                     </td>
                     <td className="text-right">
-                      {LIVE.has(s.status) && (
+                      {LIVE_SESSION_STATUSES.has(s.status) && (
                         <button
                           className="btn-ghost px-2 py-1 text-xs hover:text-red-400"
                           disabled={terminate.isPending}

@@ -91,7 +91,7 @@ async def detailed_health_check(
     services.append(vault_health)
 
     # Gateways
-    services.extend(_check_gateways())
+    services.extend(await _check_gateways(db))
 
     # Recording storage
     services.append(_check_recording_storage())
@@ -218,21 +218,72 @@ async def _check_vault() -> ServiceHealth:
     )
 
 
-def _check_gateways() -> List[ServiceHealth]:
-    """Report each session gateway by what is actually deployed."""
+async def _check_ssh_gateway(db: AsyncSession) -> ServiceHealth:
+    """The SSH gateway runs inside the backend, so "healthy" must mean more
+    than a configured path: the trusted host-key file has to parse and cover
+    every enabled SSH target (anything uncovered is refused at connect time).
+    Target reachability and credentials are only known when connecting."""
     import os
 
-    known_hosts = os.environ.get("SECUREPAM_KNOWN_HOSTS_PATH")
-    if known_hosts and os.path.isfile(known_hosts):
-        ssh = ServiceHealth(service="gateway_ssh", status="healthy",
-                            details="AsyncSSH gateway in the backend; trusted host keys provisioned")
-    else:
-        ssh = ServiceHealth(service="gateway_ssh", status="not_configured",
-                            details="No trusted host keys provisioned (SECUREPAM_KNOWN_HOSTS_PATH); SSH connections will be refused")
+    import asyncssh
+    from sqlalchemy import select
+
+    from app.models.asset import Asset
+
+    path = os.environ.get("SECUREPAM_KNOWN_HOSTS_PATH")
+    if not path or not os.path.isfile(path):
+        return ServiceHealth(service="gateway_ssh", status="not_configured",
+                             details="No trusted host keys provisioned (SECUREPAM_KNOWN_HOSTS_PATH); SSH connections will be refused")
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            known_hosts = asyncssh.import_known_hosts(handle.read())
+    except Exception as exc:
+        return ServiceHealth(service="gateway_ssh", status="unhealthy",
+                             details=_log_unhealthy("gateway_ssh", exc))
+
+    assets = (await db.execute(
+        select(Asset).where(Asset.protocol == "SSH", Asset.enabled == True,  # noqa: E712
+                            Asset.is_deleted == False)  # noqa: E712
+    )).scalars().all()
+    uncovered = [a.name for a in assets if not known_hosts.match(a.hostname, a.ip_address, a.port)[0]]
+    if uncovered:
+        return ServiceHealth(
+            service="gateway_ssh", status="degraded",
+            details=f"No trusted host key for {len(uncovered)} of {len(assets)} enabled SSH target(s): "
+                    f"{', '.join(sorted(uncovered)[:5])}; connections to them are refused",
+        )
+    return ServiceHealth(
+        service="gateway_ssh", status="healthy",
+        details=f"Host keys verified for {len(assets)} enabled SSH target(s); target reachability is checked at connect time",
+    )
+
+
+async def _check_rdp_gateway() -> ServiceHealth:
+    """Healthy only if guacd actually accepts a connection and recordings can be written."""
+    from app.services.rdp_gateway import get_rdp_gateway, rdp_recording_writable
+
+    if not settings.RDP_GATEWAY_ENABLED:
+        return ServiceHealth(service="gateway_rdp", status="not_configured",
+                             details="Guacamole (guacd) is not configured; RDP sessions cannot connect")
+    gateway = get_rdp_gateway()
+    start = time.monotonic()
+    if not await gateway.available():
+        return ServiceHealth(service="gateway_rdp", status="unhealthy",
+                             details="guacd is configured but not reachable; RDP sessions cannot connect")
+    latency = round((time.monotonic() - start) * 1000, 2)
+    if not rdp_recording_writable():
+        return ServiceHealth(service="gateway_rdp", status="degraded", latency_ms=latency,
+                             details="guacd is reachable but RDP recording storage is not writable; "
+                                     "sessions that require recording are refused")
+    return ServiceHealth(service="gateway_rdp", status="healthy", latency_ms=latency,
+                         details="guacd accepts connections and RDP recording storage is writable")
+
+
+async def _check_gateways(db: AsyncSession) -> List[ServiceHealth]:
+    """Report each session gateway by what is actually deployed."""
     return [
-        ssh,
-        ServiceHealth(service="gateway_rdp", status="not_configured",
-                      details="Guacamole is not deployed; RDP sessions cannot connect"),
+        await _check_ssh_gateway(db),
+        await _check_rdp_gateway(),
         ServiceHealth(service="gateway_web", status="not_configured",
                       details="Web gateway (NGINX/browser isolation) is not deployed"),
     ]

@@ -12,12 +12,14 @@
     "test": "vitest run"
   },
   "dependencies": {
+    "@novnc/novnc": "^1.7.0",
     "@tanstack/react-query": "^5.56.2",
     "@xterm/addon-fit": "0.10.0",
     "@xterm/xterm": "5.5.0",
     "axios": "^1.7.7",
     "clsx": "^2.1.1",
     "date-fns": "^3.6.0",
+    "guacamole-common-js": "^1.5.0",
     "keycloak-js": "^26.2.4",
     "lucide-react": "^0.441.0",
     "react": "^18.3.1",
@@ -29,6 +31,8 @@
     "@testing-library/dom": "10.4.0",
     "@testing-library/jest-dom": "6.6.3",
     "@testing-library/react": "16.1.0",
+    "@types/guacamole-common-js": "^1.5.5",
+    "@types/novnc__novnc": "^1.6.0",
     "@types/react": "^18.3.8",
     "@types/react-dom": "^18.3.0",
     "@vitejs/plugin-react": "^4.3.1",

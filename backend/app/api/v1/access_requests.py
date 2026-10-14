@@ -115,7 +115,7 @@ async def create_access_request(
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(e))
 
 
-@router.get("", response_model=PaginatedResponse[AccessRequestOut])
+@router.get("", response_model=PaginatedResponse[AccessRequestDetailOut])
 async def list_access_requests(
     pagination: PaginationParams = Depends(),
     status_filter: Optional[str] = Query(None, alias="status"),
@@ -132,7 +132,30 @@ async def list_access_requests(
         query = query.where(AccessRequest.status == status_filter)
 
     query = apply_sorting(query, AccessRequest, pagination.sort_by, pagination.sort_order, _SORTABLE_COLUMNS)
-    return await paginate(db, query, pagination, schema=AccessRequestOut)
+    # Newest first unless an allowlisted sort was asked for (as the sessions and recordings lists do):
+    # without an ORDER BY, LIMIT/OFFSET pages are arbitrary and a new request can land on any page.
+    if not pagination.sort_by or pagination.sort_by not in _SORTABLE_COLUMNS:
+        query = query.order_by(AccessRequest.created_at.desc(), AccessRequest.id)
+    page = await paginate(db, query, pagination, schema=AccessRequestDetailOut)
+    # Each item carries its grant summary (one batched query), so a client never needs a detail call per
+    # request just to know which ones can be launched; that pattern exhausted the API rate limit.
+    ids = [item.id for item in page.items]
+    if ids:
+        grants = (await db.execute(
+            select(JITGrant).where(JITGrant.request_id.in_(ids)).order_by(JITGrant.granted_at.desc())
+        )).scalars().all()
+        newest = {}
+        for grant in grants:
+            newest.setdefault(grant.request_id, grant)
+        now = datetime.now(timezone.utc)
+        for item in page.items:
+            grant = newest.get(item.id)
+            if grant is not None:
+                summary = JITGrantSummary.model_validate(grant)
+                if summary.status == "ACTIVE" and summary.expires_at <= now:
+                    summary.status = "EXPIRED"  # read-only view, as in the detail endpoint
+                item.jit_grant = summary
+    return page
 
 
 @router.get("/{request_id}", response_model=AccessRequestDetailOut)

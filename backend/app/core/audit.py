@@ -62,6 +62,13 @@ async def write_audit_log(
     )
     db.add(entry)
     await db.flush()
+    from app.core.siem import emit  # local import: keeps this module free of config at import time
+    emit({"event_id": entry.event_id, "timestamp": entry.timestamp.isoformat(), "action": action,
+          "result": result, "severity": severity, "actor": entry.actor_username,
+          "target_type": target_type, "target_id": target_id,
+          "session_id": str(session_id) if session_id else None,
+          "request_id": str(request_id) if request_id else None, "source_ip": source_ip,
+          "details": metadata or {}})
     return entry
 
 

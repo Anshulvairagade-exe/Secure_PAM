@@ -67,6 +67,10 @@ _GATEWAY_ERRORS = {
         status.HTTP_502_BAD_GATEWAY,
         "The target could not be reached from the gateway.",
     ),
+    "GATEWAY_UNAVAILABLE": (
+        status.HTTP_503_SERVICE_UNAVAILABLE,
+        "The session gateway for this protocol is not deployed; no session was started.",
+    ),
     "CREDENTIAL_UNSUPPORTED": (
         status.HTTP_409_CONFLICT,
         "The stored credential type is not supported for this protocol.",
@@ -98,6 +102,13 @@ def failure_message(reason: str) -> str:
         if reason in table:
             return table[reason][1]
     return {
+        "TICKET_REQUIRED": "A connection ticket is required.",
+        "TICKET_INVALID": "The connection ticket is invalid or has expired.",
+        "SESSION_NOT_CONNECTABLE": "This session can no longer be connected.",
+        "JIT_GRANT_INVALID": "The just-in-time grant is expired or invalid.",
+        "AUTHORIZATION_REVOKED": "User or target is no longer active.",
+        "ACCESS_REQUEST_NOT_ACTIVE": "This access request is not active.",
+        "ASSET_DISABLED": "This target is not available.",
         "RECORDING_START_FAILED": "Session recording could not start; access denied.",
         "RECORDING_WRITE_FAILED": "Session recording failed; the session was ended.",
     }.get(reason, "The session could not be started.")

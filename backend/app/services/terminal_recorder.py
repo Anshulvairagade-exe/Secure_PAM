@@ -97,6 +97,10 @@ class TerminalRecorder:
     def _elapsed(self) -> float:
         return round(time.monotonic() - (self._started or time.monotonic()), 6)
 
+    def elapsed(self) -> float:
+        """Seconds since the recording started: the clock the cast timestamps use."""
+        return self._elapsed()
+
     def output(self, data: str) -> None:
         if data:
             self._write_line([self._elapsed(), "o", data])

@@ -22,6 +22,7 @@ os.environ["ENVIRONMENT"] = "test"
 # it — live tests (tests/test_openbao_live.py) are opt-in and build their
 # own provider from OPENBAO_LIVE_* variables.
 os.environ["SECRET_PROVIDER"] = "mock"
+os.environ["RDP_GATEWAY_ENABLED"] = "false"  # tests inject fake gateways explicitly
 
 from typing import AsyncGenerator, List  # noqa: E402
 

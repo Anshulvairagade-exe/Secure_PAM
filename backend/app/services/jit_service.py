@@ -214,6 +214,13 @@ class JITService:
                                 details={"reason": reason, "jit_grant_id": str(grant.id)}))
             if session.recording_id:
                 recording = await db.get(Recording, session.recording_id)
-                if recording and recording.status == "RECORDING":
-                    recording.status = "COMPLETED"
+                # COMPLETED is earned by a closed, hashed artifact. A live SSH/RDP recorder is
+                # finalized by the gateway as the connection closes; if no gateway does so within
+                # the grace window, app.services.recording_reconciler marks it FAILED. Anything
+                # else that never produced an artifact is FAILED now. Never COMPLETED here.
+                if recording and (
+                    recording.status == "PENDING"
+                    or (recording.status == "RECORDING" and session.protocol not in ("SSH", "RDP"))
+                ):
+                    recording.status = "FAILED"
         return len(sessions)
