@@ -53,3 +53,20 @@ class CredentialRefOut(BaseModel):
     last_rotated: Optional[datetime]
     created_at: datetime
     updated_at: datetime
+
+
+class ApplicationCredentialRefOut(BaseModel):
+    """Same no-secret shape as CredentialRefOut, for a reference bound to an application."""
+    model_config = ConfigDict(from_attributes=True)
+
+    id: UUID
+    application_id: UUID
+    provider: str
+    vault_path: str
+    secret_type: str
+    username: Optional[str]
+    secret_version: Optional[int]
+    is_active: bool
+    last_rotated: Optional[datetime]
+    created_at: datetime
+    updated_at: datetime

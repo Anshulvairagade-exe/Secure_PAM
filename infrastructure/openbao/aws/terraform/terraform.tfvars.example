@@ -1,0 +1,12 @@
+# Copy to terraform.tfvars (git-ignored) and fill in. No secrets belong here.
+aws_region                         = "<region, e.g. ap-southeast-2>"
+vpc_id                             = "<vpc-...>"
+private_subnet_ids                 = ["<subnet-az-a>", "<subnet-az-b>"]
+route53_zone_id                    = "<hosted zone holding the A record (private is fine)>"
+acme_public_zone_id                = "<PUBLIC hosted zone of the same domain, ACME TXT only>"
+dns_name                           = "<bao.ops.example.com>"
+allowed_backend_security_group_ids = ["<sg-of-securepam-backend>"]
+allowed_admin_cidr_blocks          = []   # prefer SSM port-forward; add a VPN CIDR only if needed
+certbot_email                      = "<ops@example.com>"
+awskms_plugin_sha256               = "<sha256 of openbao-plugins_<ver>_linux_amd64.tar.gz from the release page>"
+alarm_sns_topic_arn                = ""   # optional

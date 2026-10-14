@@ -238,3 +238,21 @@ def test_credential_redacts_and_wipes():
     assert c.is_wiped
     with pytest.raises(RuntimeError):
         c.reveal()
+
+
+def test_openbao_health_reports_a_token_fingerprint_never_the_token():
+    import asyncio
+    import hashlib
+
+    import httpx
+    from pydantic import SecretStr
+
+    from app.secret_providers.openbao import OpenBaoSecretProvider
+
+    token = "s.token-canary-not-real-0123456789"
+    transport = httpx.MockTransport(lambda request: httpx.Response(200, json={"initialized": True, "sealed": False}))
+    provider = OpenBaoSecretProvider(addr="http://127.0.0.1:18200", token=SecretStr(token), mount_point="secret",
+                                     path_prefix="securepam", connect_timeout=1, request_timeout=1, transport=transport)
+    health = asyncio.run(provider.health())
+    assert health.healthy and hashlib.sha256(token.encode()).hexdigest()[:8] in health.detail
+    assert token not in health.detail and "canary" not in health.detail
