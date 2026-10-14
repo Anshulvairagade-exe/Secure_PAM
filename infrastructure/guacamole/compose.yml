@@ -1,0 +1,83 @@
+# Apache Guacamole 1.6.0 for SecurePAM's RDP gateway. Isolated from the main compose file.
+#
+#   cd infrastructure/guacamole
+#   GUAC_RECORDINGS_DIR=/abs/path/to/rdp-recordings docker compose up -d
+#
+# Facts verified against the 1.6.0 images (not assumed):
+#  * guacamole/guacamole has NO *_FILE support; variables are POSTGRESQL_* (POSTGRES_* is deprecated).
+#    The password is therefore read from the secret file by the entrypoint wrapper below, so it is
+#    never in this file, in `docker inspect` environment output, or in source control.
+#  * Setting any RECORDING_* variable enables the history-recording-storage extension.
+#  * guacd runs as uid 1000 and has no authentication: it is published on loopback only.
+#  * The database schema in db-init/ is applied only to a fresh data directory (postgres image
+#    behaviour); restarting never re-runs it.
+services:
+  guac-postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: guacamole_db
+      POSTGRES_USER: guacamole_owner
+      POSTGRES_PASSWORD_FILE: /run/secrets/guac_owner_password
+    secrets: [guac_owner_password, guac_db_password, guac_admin_password]
+    volumes:
+      - guac_db_data:/var/lib/postgresql/data
+      - ./db-init/01-schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+      - ./db-init/02-roles-and-admin.sh:/docker-entrypoint-initdb.d/02-roles-and-admin.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U guacamole_owner -d guacamole_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 15
+    networks: [guac-internal]
+
+  guacd:
+    image: guacamole/guacd:1.6.0
+    restart: unless-stopped
+    networks: [guac-internal]
+    ports:
+      # SecurePAM's backend (running on the host) speaks the Guacamole protocol to guacd here.
+      - "127.0.0.1:4822:4822"
+    volumes:
+      - ${GUAC_RECORDINGS_DIR:?set GUAC_RECORDINGS_DIR to an absolute host directory}:/recordings
+
+  guacamole:
+    image: guacamole/guacamole:1.6.0
+    restart: unless-stopped
+    depends_on:
+      guac-postgres:
+        condition: service_healthy
+      guacd:
+        condition: service_started
+    entrypoint:
+      - /bin/sh
+      - -c
+      - 'POSTGRESQL_PASSWORD="$$(cat /run/secrets/guac_db_password)"; export POSTGRESQL_PASSWORD; exec /opt/guacamole/bin/entrypoint.sh'
+    environment:
+      GUACD_HOSTNAME: guacd
+      POSTGRESQL_HOSTNAME: guac-postgres
+      POSTGRESQL_DATABASE: guacamole_db
+      POSTGRESQL_USERNAME: guacamole_app
+      POSTGRESQL_AUTO_CREATE_ACCOUNTS: "false"
+      RECORDING_SEARCH_PATH: /recordings
+    secrets: [guac_db_password]
+    ports:
+      - "127.0.0.1:8081:8080"
+    volumes:
+      - ${GUAC_RECORDINGS_DIR}:/recordings:ro
+    networks: [guac-internal]
+
+secrets:
+  guac_db_password:
+    file: ./.db_password
+  guac_owner_password:
+    file: ./.owner_password
+  guac_admin_password:
+    file: ./.admin_password
+
+volumes:
+  guac_db_data:
+
+networks:
+  guac-internal:
+    driver: bridge
