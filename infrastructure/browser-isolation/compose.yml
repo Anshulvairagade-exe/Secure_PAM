@@ -1,0 +1,41 @@
+# SecurePAM isolated browser (separate from the main compose file).
+#   cd infrastructure/browser-isolation && docker compose up -d --build
+# The management API and the per-session VNC ports are published on 127.0.0.1 only; the browser
+# never connects here directly: it talks to the SecurePAM backend, which authorizes and relays.
+services:
+  browser-isolation:
+    build: .
+    image: securepam/browser-isolation:local
+    restart: unless-stopped
+    # An init as PID 1 reaps orphaned Chromium processes; without it every session left zombies
+    # behind (counted against pids_limit) because the daemon only waits for its direct children.
+    init: true
+    read_only: true
+    user: "1000:1000"
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    pids_limit: 512
+    mem_limit: 3g
+    shm_size: 512m
+    tmpfs:
+      - /tmp:size=1g,mode=1777
+    environment:
+      TOKEN_FILE: /run/secrets/isolation_token
+      MAX_SESSIONS: "8"
+    secrets: [isolation_token]
+    volumes:
+      # Operator-managed private-CA trust (name-constrained; see trust_policy.py). Read-only. Absent
+      # policy file = public CAs only. Never a certificate-error override.
+      - ./trust:/etc/securepam/trust:ro
+    ports:
+      - "127.0.0.1:6090:6090"
+      - "127.0.0.1:5910-5917:5910-5917"
+    networks: [isolation-egress]
+
+secrets:
+  isolation_token:
+    file: ./.isolation_token
+
+networks:
+  isolation-egress:
+    driver: bridge
