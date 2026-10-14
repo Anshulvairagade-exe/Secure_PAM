@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { forwardRef, useEffect, useImperativeHandle, useMemo, useRef, useState } from 'react';
 import { Terminal } from '@xterm/xterm';
 import '@xterm/xterm/css/xterm.css';
 import SessionWatermark from '@/components/SessionWatermark';
@@ -21,8 +21,16 @@ export function parseCast(text: string): { header: CastHeader; events: CastEvent
   return { header, events };
 }
 
+export interface CastPlayerHandle {
+  /** Jump the replay to `seconds` into the recording (state is rebuilt from the start, then playback resumes). */
+  seek: (seconds: number) => void;
+}
+
 /** Replays a verified terminal recording. Output only; no input is ever sent anywhere. */
-export default function CastPlayer({ cast, viewer, label }: { cast: string; viewer: string; label: string }) {
+const CastPlayer = forwardRef<CastPlayerHandle, { cast: string; viewer: string; label: string }>(function CastPlayer(
+  { cast, viewer, label },
+  ref,
+) {
   const parsed = useMemo(() => {
     try {
       return { ok: true as const, ...parseCast(cast) };
@@ -33,10 +41,14 @@ export default function CastPlayer({ cast, viewer, label }: { cast: string; view
   if (!parsed.ok) {
     return <p className="text-sm text-red-400">This recording could not be read: {parsed.error}</p>;
   }
-  return <Player header={parsed.header} events={parsed.events} viewer={viewer} label={label} />;
-}
+  return <Player ref={ref} header={parsed.header} events={parsed.events} viewer={viewer} label={label} />;
+});
+export default CastPlayer;
 
-function Player({ header, events, viewer, label }: { header: CastHeader; events: CastEvent[]; viewer: string; label: string }) {
+const Player = forwardRef<CastPlayerHandle, { header: CastHeader; events: CastEvent[]; viewer: string; label: string }>(function Player(
+  { header, events, viewer, label },
+  ref,
+) {
   const containerRef = useRef<HTMLDivElement>(null);
   const termRef = useRef<Terminal | null>(null);
   const timerRef = useRef<number | null>(null);
@@ -44,6 +56,8 @@ function Player({ header, events, viewer, label }: { header: CastHeader; events:
   const [playing, setPlaying] = useState(false);
   const [speed, setSpeed] = useState(1);
   const [done, setDone] = useState(false);
+  const [current, setCurrent] = useState(0);
+  const [epoch, setEpoch] = useState(0);
   const total = events.length ? events[events.length - 1][0] : 0;
 
   useEffect(() => {
@@ -61,11 +75,8 @@ function Player({ header, events, viewer, label }: { header: CastHeader; events:
       const index = indexRef.current;
       if (!term || index >= events.length) { setPlaying(false); setDone(true); return; }
       const [time, kind, data] = events[index];
-      if (kind === 'o') term.write(data);
-      else if (kind === 'r') {
-        const [cols, rows] = data.split('x').map(Number);
-        if (cols && rows) term.resize(cols, rows);
-      }
+      apply(term, kind, data);
+      setCurrent(time);
       indexRef.current = index + 1;
       const next = events[index + 1];
       const delay = next ? Math.min(2000, ((next[0] - time) * 1000) / speed) : 0;
@@ -73,15 +84,28 @@ function Player({ header, events, viewer, label }: { header: CastHeader; events:
     };
     step();
     return () => { if (timerRef.current) window.clearTimeout(timerRef.current); };
-  }, [playing, speed, events]);
+  }, [playing, speed, events, epoch]);
 
-  const restart = () => {
+  const seek = (seconds: number, resume = true) => {
+    const term = termRef.current;
+    if (!term) return;
     if (timerRef.current) window.clearTimeout(timerRef.current);
-    termRef.current?.reset();
-    indexRef.current = 0;
+    term.reset();
+    term.resize(header.width, header.height);
+    let index = 0;
+    while (index < events.length && events[index][0] <= seconds) {
+      apply(term, events[index][1], events[index][2]);
+      index += 1;
+    }
+    indexRef.current = index;
+    setCurrent(Math.max(0, seconds));
     setDone(false);
-    setPlaying(true);
+    setPlaying(resume);
+    setEpoch((e) => e + 1);
   };
+  useImperativeHandle(ref, () => ({ seek: (seconds: number) => seek(seconds) }));
+
+  const restart = () => seek(0);
 
   return (
     <div className="space-y-2">
@@ -93,7 +117,11 @@ function Player({ header, events, viewer, label }: { header: CastHeader; events:
         <select className="input w-auto" value={speed} onChange={(e) => setSpeed(Number(e.target.value))}>
           {[1, 2, 4, 8].map((s) => <option key={s} value={s}>{s}x</option>)}
         </select>
-        <span className="text-xs text-gray-500">{events.length} events · {total.toFixed(1)} s recorded</span>
+        <input
+          type="range" min={0} max={total} step={0.1} value={Math.min(current, total)} aria-label="Seek"
+          className="min-w-0 flex-1" onChange={(e) => seek(Number(e.target.value), playing)}
+        />
+        <span className="whitespace-nowrap font-mono text-xs text-gray-400">{current.toFixed(1)} / {total.toFixed(1)} s</span>
       </div>
       <div className="relative overflow-auto rounded-lg border border-navy-700 bg-[#020617] p-2">
         <div ref={containerRef} data-testid="cast-player" />
@@ -101,4 +129,12 @@ function Player({ header, events, viewer, label }: { header: CastHeader; events:
       </div>
     </div>
   );
+});
+
+function apply(term: Terminal, kind: string, data: string) {
+  if (kind === 'o') term.write(data);
+  else if (kind === 'r') {
+    const [cols, rows] = data.split('x').map(Number);
+    if (cols && rows) term.resize(cols, rows);
+  }
 }
