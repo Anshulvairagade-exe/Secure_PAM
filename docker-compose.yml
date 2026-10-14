@@ -39,7 +39,8 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-securepam_dev_password}
       POSTGRES_DB: ${POSTGRES_DB:-securepam}
     ports:
-      - "5432:5432"
+      # Loopback only: dev credentials are defaults; containers reach it as postgres:5432.
+      - "127.0.0.1:5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
@@ -54,7 +55,8 @@ services:
     image: redis:7-alpine
     container_name: securepam-redis
     ports:
-      - "6379:6379"
+      # Loopback only: Redis has no password and holds rate-limit and ticket state.
+      - "127.0.0.1:6379:6379"
     volumes:
       - redis_data:/data
     healthcheck:
@@ -174,7 +176,8 @@ services:
       POSTGRES_USER: ${POSTGRES_USER:-securepam}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-securepam_dev_password}
     ports:
-      - "8081:8080"
+      # Loopback only: Guacamole shares the application database credentials.
+      - "127.0.0.1:8081:8080"
     depends_on:
       - guacd
       - postgres
@@ -194,7 +197,8 @@ services:
     cap_add:
       - IPC_LOCK
     ports:
-      - "8200:8200"
+      # Loopback only: dev-mode OpenBao with a well-known root token.
+      - "127.0.0.1:8200:8200"
     healthcheck:
       test: ["CMD", "bao", "status", "-address=http://127.0.0.1:8200"]
       interval: 5s

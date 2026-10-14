@@ -63,6 +63,18 @@ class Application(Base, UUIDMixin, TimestampMixin):
         Integer, nullable=False, default=30,
         comment="Session timeout in minutes"
     )
+    # Where the isolated browser starts: a path on the registered origin only (never a full URL).
+    start_path: Mapped[str] = mapped_column(
+        String(512), nullable=False, default="/", server_default="/",
+        comment="Path on the registered origin the isolated browser opens"
+    )
+    # Explicit, admin-set trust for a certificate that does not validate publicly (self-signed or
+    # wrong name): the base64 SHA-256 of the server's SubjectPublicKeyInfo. Only that exact key is
+    # accepted for this application; null means normal certificate validation only.
+    tls_pin_sha256: Mapped[Optional[str]] = mapped_column(
+        String(64), nullable=True,
+        comment="Pinned server key (base64 SHA-256 of SPKI) for an explicitly trusted certificate"
+    )
 
     # Status
     status: Mapped[str] = mapped_column(

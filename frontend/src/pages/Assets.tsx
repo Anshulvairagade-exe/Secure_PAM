@@ -1,12 +1,16 @@
 import { useState } from 'react';
+import { useSearchParams } from 'react-router-dom';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
-import { Plus, Search, Pencil, Trash2, Server } from 'lucide-react';
-import { assetsApi } from '@/api';
+import { Plus, Search, Pencil, Trash2, Server, KeyRound, CheckCircle2 } from 'lucide-react';
+import { assetsApi, credentialProvisioningApi } from '@/api';
+import {
+  CredentialFields, EMPTY_CREDENTIAL, ProvisioningBanner, ProvisioningErrorView, credentialComplete, provisioningError,
+} from '@/components/AssetCredentialForm';
 import { getApiErrorMessage } from '@/api/errors';
 import { ErrorBanner, EmptyState, Skeleton } from '@/components/Feedback';
 import Modal from '@/components/Modal';
 import { useAuth } from '@/hooks/useAuth';
-import type { Asset, AssetInput } from '@/types';
+import type { Asset, AssetInput, CredentialInput } from '@/types';
 
 const ASSET_TYPES = ['WINDOWS_SERVER', 'WINDOWS_WORKSTATION', 'LINUX_SERVER', 'UNIX_SERVER', 'NETWORK_DEVICE', 'OTHER'];
 const ENVIRONMENTS = ['DEVELOPMENT', 'TEST', 'STAGING', 'PRODUCTION'];
@@ -45,7 +49,8 @@ export default function Assets() {
   const queryClient = useQueryClient();
 
   const [page, setPage] = useState(1);
-  const [search, setSearch] = useState('');
+  const [searchParams] = useSearchParams();
+  const [search, setSearch] = useState(searchParams.get('search') ?? '');
   const [environment, setEnvironment] = useState('');
   const [criticality, setCriticality] = useState('');
   const [assetType, setAssetType] = useState('');
@@ -53,6 +58,14 @@ export default function Assets() {
   const [form, setForm] = useState<AssetInput>(EMPTY_FORM);
   const [formError, setFormError] = useState<string | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<Asset | null>(null);
+  const canVault = hasPermission('vault:manage');
+  const [credMode, setCredMode] = useState<'now' | 'later'>('later');
+  const [cred, setCred] = useState<CredentialInput>(EMPTY_CREDENTIAL);
+  const [credError, setCredError] = useState<ReturnType<typeof provisioningError> | null>(null);
+  const [credTarget, setCredTarget] = useState<Asset | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
+  const provisioning = useQuery({ queryKey: ['credential-provisioning'], queryFn: credentialProvisioningApi.status, enabled: canVault });
+  const provisioningReady = provisioning.data?.configured ?? false;
 
   const query = useQuery({
     queryKey: ['assets', { page, search, environment, criticality, assetType }],
@@ -87,6 +100,26 @@ export default function Assets() {
     onError: (e) => setFormError(getApiErrorMessage(e, 'Failed to update asset.')),
   });
 
+  const resetCred = () => { setCred(EMPTY_CREDENTIAL); setCredError(null); };
+  const createWithCredential = useMutation({
+    mutationFn: () => credentialProvisioningApi.createAsset({ asset: form, credential: cred }),
+    onSuccess: (r) => {
+      invalidate(); void queryClient.invalidateQueries({ queryKey: ['credential-provisioning'] });
+      setEditing(null); resetCred();
+      setNotice(`${r.asset.name} created. Credential stored at ${r.vault_path} (version ${r.version}) and verified.`);
+    },
+    onError: (e) => { setCredError(provisioningError(e)); setCred((c) => ({ ...c, password: '' })); },
+  });
+  const setCredential = useMutation({
+    mutationFn: (asset: Asset) => credentialProvisioningApi.setCredential(asset.id, cred),
+    onSuccess: (r) => {
+      void queryClient.invalidateQueries({ queryKey: ['credential-provisioning'] });
+      setCredTarget(null); resetCred();
+      setNotice(`Credential for ${r.asset.name} stored at ${r.vault_path} (version ${r.version}) and verified.`);
+    },
+    onError: (e) => { setCredError(provisioningError(e)); setCred((c) => ({ ...c, password: '' })); },
+  });
+
   const deleteMutation = useMutation({
     mutationFn: (id: string) => assetsApi.delete(id),
     onSuccess: () => {
@@ -98,6 +131,8 @@ export default function Assets() {
   function openCreate() {
     setForm(EMPTY_FORM);
     setFormError(null);
+    resetCred();
+    setCredMode(canVault && provisioningReady ? 'now' : 'later');
     setEditing('new');
   }
 
@@ -109,21 +144,24 @@ export default function Assets() {
 
   function submit() {
     setFormError(null);
-    if (editing === 'new') {
+    if (editing === 'new' && credMode === 'now') {
+      setCredError(null);
+      createWithCredential.mutate();
+    } else if (editing === 'new') {
       createMutation.mutate(form);
     } else if (editing) {
       updateMutation.mutate({ id: editing.id, data: form });
     }
   }
 
-  const pending = createMutation.isPending || updateMutation.isPending;
+  const pending = createMutation.isPending || updateMutation.isPending || createWithCredential.isPending;
 
   return (
     <div className="space-y-6">
-      <div className="flex items-center justify-between">
+      <div className="page-header">
         <div>
-          <h1 className="text-xl font-bold text-gray-100">Assets</h1>
-          <p className="mt-0.5 text-sm text-gray-500">Registered infrastructure targets</p>
+          <h1 className="page-title">Assets</h1>
+          <p className="page-subtitle">Registered infrastructure targets and the OpenBao credential each one uses.</p>
         </div>
         {canCreate && (
           <button onClick={openCreate} className="btn-primary">
@@ -131,6 +169,14 @@ export default function Assets() {
           </button>
         )}
       </div>
+
+      {canVault && <ProvisioningBanner status={provisioning.data} />}
+      {notice && (
+        <div role="status" className="flex items-center justify-between gap-3 rounded-lg border border-green-500/30 bg-green-500/10 px-4 py-2 text-sm text-green-400">
+          <span className="flex items-center gap-2"><CheckCircle2 size={16} /> {notice}</span>
+          <button className="text-xs text-gray-400 hover:text-gray-200" onClick={() => setNotice(null)}>Dismiss</button>
+        </div>
+      )}
 
       <div className="flex flex-wrap items-center gap-3">
         <div className="relative w-64">
@@ -200,8 +246,14 @@ export default function Assets() {
                     {(canUpdate || canDelete) && (
                       <td>
                         <div className="flex justify-end gap-1">
+                          {canVault && (
+                            <button onClick={() => { resetCred(); setCredTarget(asset); }} className="btn-ghost p-1.5"
+                              title="Set or rotate this asset's credential in OpenBao" aria-label={`Set credential for ${asset.name}`}>
+                              <KeyRound size={14} />
+                            </button>
+                          )}
                           {canUpdate && (
-                            <button onClick={() => openEdit(asset)} className="btn-ghost p-1.5">
+                            <button onClick={() => openEdit(asset)} className="btn-ghost p-1.5" aria-label={`Edit ${asset.name}`}>
                               <Pencil size={14} />
                             </button>
                           )}
@@ -305,10 +357,49 @@ export default function Assets() {
               <Checkbox label="Recording required" checked={form.recording_required} onChange={(v) => setForm({ ...form, recording_required: v })} />
             </div>
 
+            {editing === 'new' && canVault && (
+              <fieldset className="space-y-3 rounded-lg border border-navy-700/60 p-4">
+                <legend className="px-1 text-sm font-semibold text-gray-200">Credential</legend>
+                <div className="flex flex-wrap gap-4 text-sm" role="radiogroup" aria-label="Credential provisioning">
+                  <label className="flex items-center gap-2 text-gray-300">
+                    <input type="radio" name="credmode" checked={credMode === 'now'} disabled={!provisioningReady}
+                      onChange={() => setCredMode('now')} />
+                    Provision now in OpenBao
+                  </label>
+                  <label className="flex items-center gap-2 text-gray-300">
+                    <input type="radio" name="credmode" checked={credMode === 'later'} onChange={() => setCredMode('later')} />
+                    Later, or in the OpenBao UI
+                  </label>
+                </div>
+                {!provisioningReady && (
+                  <p className="text-xs text-amber-400">{provisioning.data?.reason ?? 'Credential provisioning status is unavailable.'}</p>
+                )}
+                {credMode === 'now' && <CredentialFields status={provisioning.data} value={cred} onChange={setCred} />}
+                {credError && <ProvisioningErrorView error={credError} />}
+              </fieldset>
+            )}
+
             <div className="flex justify-end gap-2 pt-2">
-              <button className="btn-secondary" onClick={() => setEditing(null)}>Cancel</button>
-              <button className="btn-primary" disabled={pending} onClick={submit}>
+              <button className="btn-secondary" onClick={() => { setEditing(null); resetCred(); }}>Cancel</button>
+              <button className="btn-primary" disabled={pending || (editing === 'new' && credMode === 'now' && !credentialComplete(cred))} onClick={submit}>
                 {pending ? 'Saving...' : editing === 'new' ? 'Create Asset' : 'Save Changes'}
+              </button>
+            </div>
+          </div>
+        </Modal>
+      )}
+
+      {credTarget && (
+        <Modal title={`Credential for ${credTarget.name}`} onClose={() => { setCredTarget(null); resetCred(); }}>
+          <div className="space-y-4">
+            {!provisioningReady && <ProvisioningBanner status={provisioning.data} />}
+            <CredentialFields status={provisioning.data} value={cred} onChange={setCred} currentAssetId={credTarget.id} />
+            {credError && <ProvisioningErrorView error={credError} />}
+            <div className="flex justify-end gap-2 pt-2">
+              <button className="btn-secondary" onClick={() => { setCredTarget(null); resetCred(); }}>Cancel</button>
+              <button className="btn-primary" disabled={!provisioningReady || !credentialComplete(cred) || setCredential.isPending}
+                onClick={() => { setCredError(null); setCredential.mutate(credTarget); }}>
+                {setCredential.isPending ? 'Storing and verifying…' : 'Store and verify'}
               </button>
             </div>
           </div>

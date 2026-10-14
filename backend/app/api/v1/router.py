@@ -12,11 +12,22 @@ from app.api.v1.applications import router as applications_router
 from app.api.v1.policies import router as policies_router
 from app.api.v1.access_requests import router as access_requests_router
 from app.api.v1.approvals import router as approvals_router
+from app.api.v1.credential_refs import application_router as application_credential_refs_router
+from app.api.v1.asset_credentials import router as asset_credentials_router
+from app.api.v1.risk import router as risk_router
 from app.api.v1.credential_refs import router as credential_refs_router
 # M9 & M12 Routers
 from app.api.v1.sessions import router as sessions_router
 from app.api.v1.recordings import router as recordings_router
 from app.api.v1.audit import router as audit_router
+from app.api.v1.system_settings import router as system_settings_router
+# Member 10 Router
+from app.api.v1.ssh_sessions import router as ssh_sessions_router
+from app.api.v1.jit_grants import router as jit_grants_router
+from app.api.v1.users import router as users_router
+from app.api.v1.session_admin import router as session_admin_router
+from app.api.v1.rdp_sessions import router as rdp_sessions_router
+from app.api.v1.web_sessions import router as web_sessions_router
 
 # Main v1 router
 api_router = APIRouter()
@@ -30,7 +41,18 @@ api_router.include_router(policies_router)
 api_router.include_router(access_requests_router)
 api_router.include_router(approvals_router)
 api_router.include_router(credential_refs_router)
+api_router.include_router(asset_credentials_router)
+api_router.include_router(risk_router)
+api_router.include_router(application_credential_refs_router)
 # Registered M9 & M12 sub-routers
 api_router.include_router(sessions_router)
 api_router.include_router(recordings_router)
 api_router.include_router(audit_router)
+api_router.include_router(system_settings_router)
+# Registered Member 10 sub-router
+api_router.include_router(ssh_sessions_router)
+api_router.include_router(jit_grants_router)
+api_router.include_router(users_router)
+api_router.include_router(session_admin_router)
+api_router.include_router(rdp_sessions_router)
+api_router.include_router(web_sessions_router)

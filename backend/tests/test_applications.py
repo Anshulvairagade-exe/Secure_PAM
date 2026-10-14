@@ -190,3 +190,27 @@ async def test_invalid_sort_order_returns_422(
         headers=auth_header(admin_token),
     )
     assert resp.status_code == 422
+
+
+async def test_scheme_correction_rederives_target_url_and_keeps_pin(client: AsyncClient, admin_token: str):
+    """The Wazuh incident shape: an app registered as HTTP on a TLS-only
+    port is corrected to HTTPS via PATCH; target_url is re-derived
+    server-side and the pinned key is preserved (never weakened)."""
+    create = await client.post(
+        "/api/v1/applications",
+        json={**VALID_APP, "name": "SCHEME-FIX", "hostname": "3.104.196.100", "port": 443,
+              "protocol": "HTTP", "start_path": "/app/login",
+              "tls_pin_sha256": "aVC3pWLrYDf71LHR8+We+W5/PsCBWjACBjWLTQvYq3g="},
+        headers=auth_header(admin_token),
+    )
+    assert create.status_code == 201, create.text
+    assert create.json()["target_url"] == "http://3.104.196.100:443/app/login"
+    app_id = create.json()["id"]
+
+    resp = await client.patch(
+        f"/api/v1/applications/{app_id}", json={"protocol": "HTTPS"}, headers=auth_header(admin_token)
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["target_url"] == "https://3.104.196.100:443/app/login"
+    assert body["tls_pin_sha256"] == "aVC3pWLrYDf71LHR8+We+W5/PsCBWjACBjWLTQvYq3g="

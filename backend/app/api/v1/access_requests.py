@@ -12,6 +12,7 @@ cancel on someone else's request returns 404 (not 403), so a non-owner
 can't even confirm the request exists. See _get_visible_request_or_404.
 """
 
+from datetime import datetime, timezone
 from typing import Optional
 from uuid import UUID
 
@@ -23,8 +24,14 @@ from app.core.audit import client_ip, write_audit_log
 from app.core.deps import get_current_active_user, get_db
 from app.core.pagination import apply_sorting, paginate
 from app.models.access_request import AccessRequest
+from app.models.jit_grant import JITGrant
 from app.models.user import User
-from app.schemas.access_requests import AccessRequestCreate, AccessRequestOut
+from app.schemas.access_requests import (
+    AccessRequestCreate,
+    AccessRequestDetailOut,
+    AccessRequestOut,
+    JITGrantSummary,
+)
 from app.schemas.common import PaginatedResponse, PaginationParams
 from app.services.access_decision import (
     AccessDecisionService,
@@ -108,7 +115,7 @@ async def create_access_request(
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(e))
 
 
-@router.get("", response_model=PaginatedResponse[AccessRequestOut])
+@router.get("", response_model=PaginatedResponse[AccessRequestDetailOut])
 async def list_access_requests(
     pagination: PaginationParams = Depends(),
     status_filter: Optional[str] = Query(None, alias="status"),
@@ -125,10 +132,33 @@ async def list_access_requests(
         query = query.where(AccessRequest.status == status_filter)
 
     query = apply_sorting(query, AccessRequest, pagination.sort_by, pagination.sort_order, _SORTABLE_COLUMNS)
-    return await paginate(db, query, pagination, schema=AccessRequestOut)
+    # Newest first unless an allowlisted sort was asked for (as the sessions and recordings lists do):
+    # without an ORDER BY, LIMIT/OFFSET pages are arbitrary and a new request can land on any page.
+    if not pagination.sort_by or pagination.sort_by not in _SORTABLE_COLUMNS:
+        query = query.order_by(AccessRequest.created_at.desc(), AccessRequest.id)
+    page = await paginate(db, query, pagination, schema=AccessRequestDetailOut)
+    # Each item carries its grant summary (one batched query), so a client never needs a detail call per
+    # request just to know which ones can be launched; that pattern exhausted the API rate limit.
+    ids = [item.id for item in page.items]
+    if ids:
+        grants = (await db.execute(
+            select(JITGrant).where(JITGrant.request_id.in_(ids)).order_by(JITGrant.granted_at.desc())
+        )).scalars().all()
+        newest = {}
+        for grant in grants:
+            newest.setdefault(grant.request_id, grant)
+        now = datetime.now(timezone.utc)
+        for item in page.items:
+            grant = newest.get(item.id)
+            if grant is not None:
+                summary = JITGrantSummary.model_validate(grant)
+                if summary.status == "ACTIVE" and summary.expires_at <= now:
+                    summary.status = "EXPIRED"  # read-only view, as in the detail endpoint
+                item.jit_grant = summary
+    return page
 
 
-@router.get("/{request_id}", response_model=AccessRequestOut)
+@router.get("/{request_id}", response_model=AccessRequestDetailOut)
 async def get_access_request(
     request_id: UUID,
     db: AsyncSession = Depends(get_db),
@@ -136,7 +166,23 @@ async def get_access_request(
 ):
     if not _can_view_all(current_user) and not _can_view_own(current_user):
         raise HTTPException(status.HTTP_403_FORBIDDEN, "You are not authorized to view access requests.")
-    return await _get_visible_request_or_404(db, request_id, current_user)
+    access_request = await _get_visible_request_or_404(db, request_id, current_user)
+
+    grant = (
+        await db.execute(
+            select(JITGrant)
+            .where(JITGrant.request_id == access_request.id)
+            .order_by(JITGrant.granted_at.desc())
+        )
+    ).scalars().first()
+    detail = AccessRequestDetailOut.model_validate(access_request)
+    if grant is not None:
+        summary = JITGrantSummary.model_validate(grant)
+        # Read-only view: report a lapsed grant as EXPIRED without writing.
+        if summary.status == "ACTIVE" and summary.expires_at <= datetime.now(timezone.utc):
+            summary.status = "EXPIRED"
+        detail.jit_grant = summary
+    return detail
 
 
 @router.post("/{request_id}/cancel", response_model=AccessRequestOut)

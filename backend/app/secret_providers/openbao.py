@@ -125,6 +125,12 @@ class OpenBaoSecretProvider(SecretProvider):
         version = metadata.get("version")
         return SecretRecord(data=data, version=version if isinstance(version, int) else None)
 
+    def _token_fingerprint(self) -> str:
+        """First 8 hex chars of SHA-256(token): lets an operator confirm WHICH token this process holds
+        (compare with the fingerprint of the token they minted) without ever revealing it."""
+        import hashlib
+        return hashlib.sha256(self._token.get_secret_value().encode()).hexdigest()[:8]
+
     async def health(self) -> ProviderHealth:
         # sys/health is unauthenticated — no token is sent for this check.
         start = time.monotonic()
@@ -136,7 +142,9 @@ class OpenBaoSecretProvider(SecretProvider):
         latency = round((time.monotonic() - start) * 1000, 2)
 
         if response.status_code == 200:
-            return ProviderHealth(self.name, True, "OpenBao reachable, unsealed, active", latency)
+            return ProviderHealth(self.name, True,
+                                  f"OpenBao reachable, unsealed, active (app token fingerprint {self._token_fingerprint()})",
+                                  latency)
         detail = {
             429: "OpenBao node is a standby",
             501: "OpenBao is not initialized",

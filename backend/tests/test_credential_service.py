@@ -379,7 +379,7 @@ async def test_tampered_reference_path_denied(db_session, path):
         (lambda: _provider(available=False), "PROVIDER_UNAVAILABLE"),
         (lambda: _provider(denied_paths=[PATH]), "PROVIDER_ACCESS_DENIED"),
         (lambda: MockSecretProvider({}), "SECRET_NOT_FOUND"),
-        (lambda: MockSecretProvider({PATH: {"username": "x"}}), "PROVIDER_ERROR"),
+        (lambda: MockSecretProvider({PATH: {"username": "x"}}), "MALFORMED_SECRET"),
     ],
 )
 async def test_provider_failure_fails_closed_and_is_audited(db_session, provider, code):

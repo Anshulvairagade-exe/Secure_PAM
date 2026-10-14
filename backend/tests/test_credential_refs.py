@@ -128,8 +128,8 @@ async def test_secret_never_appears_in_http_responses(client, db_session, admin_
         assert PASSWORD not in r.text, path
 
 
-async def test_detailed_health_reports_mock_provider(client):
-    r = await client.get("/health/detailed")
+async def test_detailed_health_reports_mock_provider(client, admin_token):
+    r = await client.get("/health/detailed", headers=auth_header(admin_token))
     vault = next(s for s in r.json()["services"] if s["service"] == "vault")
-    assert vault["status"] == "healthy"
+    assert vault["status"] == "mock"  # a development stand-in is not reported as healthy
     assert vault["details"].startswith("mock:")

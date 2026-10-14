@@ -1,6 +1,7 @@
 import { useParams, useNavigate } from 'react-router-dom';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
-import { ArrowLeft, ShieldAlert, ShieldCheck, Clock } from 'lucide-react';
+import { ArrowLeft, ShieldAlert, ShieldCheck, Clock, KeyRound } from 'lucide-react';
+import { formatDistanceToNow } from 'date-fns';
 import { accessRequestsApi } from '@/api';
 import { getApiErrorMessage } from '@/api/errors';
 import { ErrorBanner, Skeleton } from '@/components/Feedback';
@@ -147,6 +148,31 @@ export default function AccessRequestDetail() {
           <ControlBadge label="Recording" active={req.recording_required} />
         </div>
       </div>
+
+      {req.jit_required && (
+        <div className="card p-5">
+          <h2 className="mb-3 flex items-center gap-2 text-sm font-semibold text-gray-200">
+            <KeyRound size={16} /> Just-in-Time Grant
+          </h2>
+          {req.jit_grant ? (
+            <div className="space-y-1 text-sm text-gray-300">
+              <p>
+                <span className={req.jit_grant.status === 'ACTIVE' ? 'badge-success' : 'badge-neutral'}>
+                  {req.jit_grant.status}
+                </span>
+                <span className="ml-3 text-gray-400">{req.jit_grant.protocol} access bound to this request</span>
+              </p>
+              <p className="text-gray-400">
+                Granted {new Date(req.jit_grant.granted_at).toLocaleString()} · {req.jit_grant.status === 'ACTIVE' ? 'expires' : req.jit_grant.status === 'REVOKED' ? 'revoked' : 'expired'}{' '}
+                {formatDistanceToNow(new Date(req.jit_grant.revoked_at ?? req.jit_grant.expires_at), { addSuffix: true })}
+                {' '}({new Date(req.jit_grant.expires_at).toLocaleString()})
+              </p>
+            </div>
+          ) : (
+            <p className="text-sm text-gray-500">No grant issued yet. A grant is created when the request is approved.</p>
+          )}
+        </div>
+      )}
     </div>
   );
 }

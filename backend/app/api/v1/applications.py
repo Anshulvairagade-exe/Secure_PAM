@@ -35,8 +35,9 @@ _SORTABLE_COLUMNS = {
 _ACTIVE_SESSION_STATUSES = ("CREATED", "STARTING", "ACTIVE", "TERMINATING")
 
 
-def _build_target_url(hostname: str, port: int, protocol: str) -> str:
-    return f"{protocol.lower()}://{hostname}:{port}"
+def _build_target_url(hostname: str, port: int, protocol: str, start_path: str = "/") -> str:
+    # Unchanged format for the default path; a registered start path is appended.
+    return f"{protocol.lower()}://{hostname}:{port}{'' if start_path in ('', '/') else start_path}"
 
 
 def _validate_or_422(hostname: str, port: int, protocol: str) -> None:
@@ -96,7 +97,7 @@ async def create_application(
 
     application = Application(
         **body.model_dump(),
-        target_url=_build_target_url(body.hostname, body.port, body.protocol),
+        target_url=_build_target_url(body.hostname, body.port, body.protocol, body.start_path),
         created_by=current_user.id,
         updated_by=current_user.id,
     )
@@ -141,12 +142,14 @@ async def update_application(
     # Re-resolve the effective hostname/port/protocol (existing value for
     # anything not in this PATCH) and re-validate + re-derive target_url
     # whenever any of the three actually changed.
-    if {"hostname", "port", "protocol"} & changes.keys():
+    if {"hostname", "port", "protocol", "start_path"} & changes.keys():
         hostname = changes.get("hostname", application.hostname)
         port = changes.get("port", application.port)
         protocol = changes.get("protocol", application.protocol)
+        start_path = changes.get("start_path") or application.start_path or "/"
+        changes["start_path"] = start_path
         _validate_or_422(hostname, port, protocol)
-        changes["target_url"] = _build_target_url(hostname, port, protocol)
+        changes["target_url"] = _build_target_url(hostname, port, protocol, start_path)
 
     for field, value in changes.items():
         setattr(application, field, value)

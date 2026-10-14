@@ -18,7 +18,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
-from app.core.deps import get_db
+from app.core.deps import get_current_active_user, get_db
 from app.core.logging import get_logger
 from app.schemas.common import DetailedHealthCheck, HealthCheck, LivenessCheck, ReadinessCheck, ServiceHealth
 
@@ -65,8 +65,13 @@ async def readiness_check(response: Response, db: AsyncSession = Depends(get_db)
 
 
 @router.get("/health/detailed", response_model=DetailedHealthCheck)
-async def detailed_health_check(db: AsyncSession = Depends(get_db)):
-    """Detailed health check with all service statuses."""
+async def detailed_health_check(
+    db: AsyncSession = Depends(get_db),
+    _: object = Depends(get_current_active_user),
+):
+    """Per-service status for signed-in users. Statuses: healthy, degraded,
+    unhealthy, mock (a development stand-in is active), not_configured (the
+    integration is not deployed). Only real failures degrade the overall status."""
     services: List[ServiceHealth] = []
 
     # Database
@@ -78,16 +83,18 @@ async def detailed_health_check(db: AsyncSession = Depends(get_db)):
     services.append(redis_health)
 
     # IdP
-    idp_health = _check_idp()
+    idp_health = await _check_idp()
     services.append(idp_health)
 
     # Vault
     vault_health = await _check_vault()
     services.append(vault_health)
 
-    # Gateway
-    gateway_health = _check_gateway()
-    services.append(gateway_health)
+    # Gateways
+    services.extend(await _check_gateways(db))
+
+    # Recording storage
+    services.append(_check_recording_storage())
 
     # SIEM
     siem_health = _check_siem()
@@ -162,19 +169,30 @@ async def _check_redis() -> ServiceHealth:
         )
 
 
-def _check_idp() -> ServiceHealth:
-    """Check IdP status."""
+async def _check_idp() -> ServiceHealth:
+    """DEV_MODE uses local development accounts; otherwise probe Keycloak's
+    OIDC discovery document."""
     if settings.DEV_MODE:
         return ServiceHealth(
             service="identity_provider",
-            status="healthy",
-            details="DEV_MODE: MockIdP active",
+            status="mock",
+            details="DEV_MODE: local development accounts; Keycloak not in use",
         )
-    return ServiceHealth(
-        service="identity_provider",
-        status="degraded",
-        details="Keycloak not yet configured",
-    )
+    import httpx
+
+    start = time.monotonic()
+    try:
+        async with httpx.AsyncClient(timeout=3, trust_env=False) as client:
+            response = await client.get(f"{settings.KEYCLOAK_ISSUER_URL}/.well-known/openid-configuration")
+        latency = round((time.monotonic() - start) * 1000, 2)
+        if response.status_code == 200:
+            return ServiceHealth(service="identity_provider", status="healthy", latency_ms=latency,
+                                 details="Keycloak OIDC discovery reachable")
+        return ServiceHealth(service="identity_provider", status="unhealthy", latency_ms=latency,
+                             details=f"Keycloak discovery returned HTTP {response.status_code}")
+    except httpx.HTTPError as exc:
+        return ServiceHealth(service="identity_provider", status="unhealthy",
+                             details=_log_unhealthy("identity_provider", exc))
 
 
 async def _check_vault() -> ServiceHealth:
@@ -189,6 +207,9 @@ async def _check_vault() -> ServiceHealth:
     result = await get_secret_provider().health()
     if result.provider == "mock" and result.healthy and not settings.DEV_MODE:
         return ServiceHealth(service="vault", status="degraded", details="Mock secret provider active outside DEV_MODE")
+    if result.provider == "mock":
+        return ServiceHealth(service="vault", status="mock",
+                             details="mock: in-memory development secrets; OpenBao not in use")
     return ServiceHealth(
         service="vault",
         status="healthy" if result.healthy else "unhealthy",
@@ -197,19 +218,85 @@ async def _check_vault() -> ServiceHealth:
     )
 
 
-def _check_gateway() -> ServiceHealth:
-    """Check session gateway status."""
-    if settings.DEV_MODE:
+async def _check_ssh_gateway(db: AsyncSession) -> ServiceHealth:
+    """The SSH gateway runs inside the backend, so "healthy" must mean more
+    than a configured path: the trusted host-key file has to parse and cover
+    every enabled SSH target (anything uncovered is refused at connect time).
+    Target reachability and credentials are only known when connecting."""
+    import os
+
+    import asyncssh
+    from sqlalchemy import select
+
+    from app.models.asset import Asset
+
+    path = os.environ.get("SECUREPAM_KNOWN_HOSTS_PATH")
+    if not path or not os.path.isfile(path):
+        return ServiceHealth(service="gateway_ssh", status="not_configured",
+                             details="No trusted host keys provisioned (SECUREPAM_KNOWN_HOSTS_PATH); SSH connections will be refused")
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            known_hosts = asyncssh.import_known_hosts(handle.read())
+    except Exception as exc:
+        return ServiceHealth(service="gateway_ssh", status="unhealthy",
+                             details=_log_unhealthy("gateway_ssh", exc))
+
+    assets = (await db.execute(
+        select(Asset).where(Asset.protocol == "SSH", Asset.enabled == True,  # noqa: E712
+                            Asset.is_deleted == False)  # noqa: E712
+    )).scalars().all()
+    uncovered = [a.name for a in assets if not known_hosts.match(a.hostname, a.ip_address, a.port)[0]]
+    if uncovered:
         return ServiceHealth(
-            service="gateway",
-            status="healthy",
-            details="DEV_MODE: MockSessionProvider active",
+            service="gateway_ssh", status="degraded",
+            details=f"No trusted host key for {len(uncovered)} of {len(assets)} enabled SSH target(s): "
+                    f"{', '.join(sorted(uncovered)[:5])}; connections to them are refused",
         )
     return ServiceHealth(
-        service="gateway",
-        status="degraded",
-        details="Guacamole not yet configured",
+        service="gateway_ssh", status="healthy",
+        details=f"Host keys verified for {len(assets)} enabled SSH target(s); target reachability is checked at connect time",
     )
+
+
+async def _check_rdp_gateway() -> ServiceHealth:
+    """Healthy only if guacd actually accepts a connection and recordings can be written."""
+    from app.services.rdp_gateway import get_rdp_gateway, rdp_recording_writable
+
+    if not settings.RDP_GATEWAY_ENABLED:
+        return ServiceHealth(service="gateway_rdp", status="not_configured",
+                             details="Guacamole (guacd) is not configured; RDP sessions cannot connect")
+    gateway = get_rdp_gateway()
+    start = time.monotonic()
+    if not await gateway.available():
+        return ServiceHealth(service="gateway_rdp", status="unhealthy",
+                             details="guacd is configured but not reachable; RDP sessions cannot connect")
+    latency = round((time.monotonic() - start) * 1000, 2)
+    if not rdp_recording_writable():
+        return ServiceHealth(service="gateway_rdp", status="degraded", latency_ms=latency,
+                             details="guacd is reachable but RDP recording storage is not writable; "
+                                     "sessions that require recording are refused")
+    return ServiceHealth(service="gateway_rdp", status="healthy", latency_ms=latency,
+                         details="guacd accepts connections and RDP recording storage is writable")
+
+
+async def _check_gateways(db: AsyncSession) -> List[ServiceHealth]:
+    """Report each session gateway by what is actually deployed."""
+    return [
+        await _check_ssh_gateway(db),
+        await _check_rdp_gateway(),
+        ServiceHealth(service="gateway_web", status="not_configured",
+                      details="Web gateway (NGINX/browser isolation) is not deployed"),
+    ]
+
+
+def _check_recording_storage() -> ServiceHealth:
+    from app.services.terminal_recorder import storage_writable
+
+    if storage_writable():
+        return ServiceHealth(service="recording_storage", status="healthy",
+                             details="Recording storage writable")
+    return ServiceHealth(service="recording_storage", status="unhealthy",
+                         details="Recording storage is not writable; sessions that require recording will be refused")
 
 
 def _check_siem() -> ServiceHealth:
@@ -217,8 +304,8 @@ def _check_siem() -> ServiceHealth:
     if settings.DEV_MODE or not settings.WAZUH_ENABLED:
         return ServiceHealth(
             service="siem",
-            status="healthy",
-            details="DEV_MODE: MockSIEM active",
+            status="not_configured",
+            details="No SIEM forwarding; events are kept in the SecurePAM audit log only",
         )
     return ServiceHealth(
         service="siem",

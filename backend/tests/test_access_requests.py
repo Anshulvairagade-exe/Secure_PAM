@@ -361,3 +361,72 @@ async def test_inactive_admin_role_cannot_view_all_requests(
     finally:
         role.is_active = original_active
         await db_session.commit()
+
+
+async def test_list_defaults_to_newest_first_so_new_requests_are_on_page_one(
+    client: AsyncClient, operator_token: str, db_session: AsyncSession
+):
+    """Regression: with no ORDER BY, LIMIT/OFFSET returned an arbitrary page, so once an operator had more
+    ACTIVE requests than one page held, a just-approved request could be missing from My Sessions."""
+    from datetime import datetime, timedelta, timezone
+    from app.core.security import generate_request_number
+    from app.models.access_request import AccessRequest
+    from app.models.user import User
+
+    asset = await _get(db_session, Asset, name="LINUX-DEV-01")
+    user = await _get(db_session, User, username="operator")
+    old = datetime.now(timezone.utc) - timedelta(days=1)
+    for i in range(6):
+        db_session.add(AccessRequest(
+            request_number=generate_request_number(), user_id=user.id, asset_id=asset.id, protocol="SSH",
+            reason=f"old {i}", requested_duration=15, status="ACTIVE", approval_required=False,
+            jit_required=True, mfa_required=False, recording_required=False, created_at=old + timedelta(minutes=i)))
+    newest = AccessRequest(
+        request_number=generate_request_number(), user_id=user.id, asset_id=asset.id, protocol="SSH",
+        reason="newest", requested_duration=15, status="ACTIVE", approval_required=False,
+        jit_required=True, mfa_required=False, recording_required=False)
+    db_session.add(newest)
+    await db_session.commit()
+
+    resp = await client.get("/api/v1/access-requests?status=ACTIVE&page=1&page_size=3", headers=auth_header(operator_token))
+    items = resp.json()["items"]
+    assert resp.status_code == 200 and items[0]["reason"] == "newest"
+    stamps = [i["created_at"] for i in items]
+    assert stamps == sorted(stamps, reverse=True)
+
+
+async def test_list_items_carry_their_grant_summary(
+    client: AsyncClient, operator_token: str, db_session: AsyncSession
+):
+    """Clients can tell which requests are launchable from the list alone (no per-request detail calls,
+    which exhausted the rate limit), and a lapsed grant reads EXPIRED without anything being written."""
+    from datetime import datetime, timedelta, timezone
+    from app.core.security import generate_request_number
+    from app.models.access_request import AccessRequest
+    from app.models.jit_grant import JITGrant
+    from app.models.user import User
+
+    asset = await _get(db_session, Asset, name="LINUX-DEV-01")
+    user = await _get(db_session, User, username="operator")
+    now = datetime.now(timezone.utc)
+    reqs = []
+    for label, expires in (("live", now + timedelta(minutes=30)), ("lapsed", now - timedelta(minutes=1)), ("none", None)):
+        r = AccessRequest(request_number=generate_request_number(), user_id=user.id, asset_id=asset.id, protocol="SSH",
+                          reason=label, requested_duration=15, status="ACTIVE", approval_required=False,
+                          jit_required=True, mfa_required=False, recording_required=False)
+        db_session.add(r)
+        await db_session.flush()
+        if expires:
+            db_session.add(JITGrant(request_id=r.id, user_id=user.id, asset_id=asset.id, protocol="SSH",
+                                    granted_at=now - timedelta(minutes=5), expires_at=expires, status="ACTIVE"))
+        reqs.append(r)
+    await db_session.commit()
+
+    items = {i["reason"]: i for i in (await client.get("/api/v1/access-requests?status=ACTIVE",
+                                                       headers=auth_header(operator_token))).json()["items"]}
+    assert items["live"]["jit_grant"]["status"] == "ACTIVE"
+    assert items["lapsed"]["jit_grant"]["status"] == "EXPIRED"
+    assert items["none"]["jit_grant"] is None
+    stored = (await db_session.execute(select(JITGrant).where(JITGrant.request_id == reqs[1].id))).scalar_one()
+    await db_session.refresh(stored)
+    assert stored.status == "ACTIVE"  # the list never writes

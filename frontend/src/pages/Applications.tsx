@@ -175,6 +175,7 @@ export default function Applications() {
                   <th>Environment</th>
                   <th>Criticality</th>
                   <th>Access Mode</th>
+                  <th>Recording</th>
                   <th>Enabled</th>
                   {(canUpdate || canDelete) && <th></th>}
                 </tr>
@@ -188,6 +189,13 @@ export default function Applications() {
                     <td className="text-gray-400">{app.environment}</td>
                     <td><span className={CRITICALITY_BADGE[app.criticality]}>{app.criticality}</span></td>
                     <td className="text-gray-400">{app.access_mode}</td>
+                    <td>
+                      {app.access_mode === 'ISOLATED_BROWSER'
+                        ? app.recording_required
+                          ? <span className="badge-danger" title="Isolated-browser sessions cannot be screen-recorded, so launches of this application are refused">required · launches blocked</span>
+                          : <span className="text-xs text-gray-500" title="Not screen-recorded; launch, egress denials and session end are audited">unavailable · events only</span>
+                        : <span className="text-xs text-gray-500">{app.recording_required ? 'required' : 'not required'}</span>}
+                    </td>
                     <td>
                       <span className={app.enabled ? 'badge-success' : 'badge-neutral'}>
                         {app.enabled ? 'Enabled' : 'Disabled'}
@@ -301,6 +309,9 @@ export default function Applications() {
               <Checkbox label="Approval required" checked={form.approval_required} onChange={(v) => setForm({ ...form, approval_required: v })} />
               <Checkbox label="MFA required" checked={form.mfa_required} onChange={(v) => setForm({ ...form, mfa_required: v })} />
               <Checkbox label="Recording required" checked={form.recording_required} onChange={(v) => setForm({ ...form, recording_required: v })} />
+              {form.access_mode === 'ISOLATED_BROWSER' && form.recording_required && (
+                <p className="col-span-2 text-xs text-amber-400">Isolated-browser sessions are not screen-recorded: with this set, every launch of this application is refused.</p>
+              )}
               <Checkbox label="Download allowed" checked={form.download_allowed} onChange={(v) => setForm({ ...form, download_allowed: v })} />
               <Checkbox label="Upload allowed" checked={form.upload_allowed} onChange={(v) => setForm({ ...form, upload_allowed: v })} />
               <Checkbox label="Clipboard allowed" checked={form.clipboard_allowed} onChange={(v) => setForm({ ...form, clipboard_allowed: v })} />

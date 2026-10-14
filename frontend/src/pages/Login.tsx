@@ -1,5 +1,5 @@
 
-import { useEffect } from 'react';
+import { FormEvent, useEffect, useState } from 'react';
 import { useNavigate, useLocation, Navigate } from 'react-router-dom';
 import { ShieldHalf } from 'lucide-react';
 import { useAuth } from '@/hooks/useAuth';
@@ -7,8 +7,26 @@ import { useKeycloak } from '@/auth/KeycloakProvider';
 import { ErrorBanner } from '@/components/Feedback';
 
 export default function Login() {
-  const { isAuthenticated, isLoading } = useAuth();
+  const { isAuthenticated, isLoading, devMode, login: devLogin } = useAuth();
   const { login, initialized, authenticated } = useKeycloak();
+  const [username, setUsername] = useState('');
+  const [password, setPassword] = useState('');
+  const [devError, setDevError] = useState<string | null>(null);
+  const [submitting, setSubmitting] = useState(false);
+
+  const submitDevLogin = async (event: FormEvent) => {
+    event.preventDefault();
+    setDevError(null);
+    setSubmitting(true);
+    try {
+      await devLogin(username, password);
+      setPassword('');
+    } catch {
+      setDevError('Sign-in failed. Check the username and password.');
+    } finally {
+      setSubmitting(false);
+    }
+  };
   const navigate = useNavigate();
   const location = useLocation();
 
@@ -16,10 +34,10 @@ export default function Login() {
     (location.state as { from?: { pathname?: string } } | null)?.from?.pathname ?? '/';
 
   useEffect(() => {
-    if (initialized && authenticated && !isLoading && isAuthenticated) {
+    if (initialized && (authenticated || devMode) && !isLoading && isAuthenticated) {
       navigate(from, { replace: true });
     }
-  }, [initialized, authenticated, isLoading, isAuthenticated, navigate, from]);
+  }, [initialized, authenticated, devMode, isLoading, isAuthenticated, navigate, from]);
 
   if (isAuthenticated) {
     return <Navigate to={from} replace />;
@@ -44,6 +62,30 @@ export default function Login() {
             <p className="text-center text-sm text-gray-400">
               Initializing secure sign-in...
             </p>
+          ) : devMode ? (
+            <form onSubmit={submitDevLogin} className="space-y-3">
+              <input
+                className="input"
+                placeholder="Username"
+                autoComplete="username"
+                value={username}
+                onChange={e => setUsername(e.target.value)}
+                required
+              />
+              <input
+                className="input"
+                type="password"
+                placeholder="Password"
+                autoComplete="current-password"
+                value={password}
+                onChange={e => setPassword(e.target.value)}
+                required
+              />
+              <button type="submit" className="btn-primary w-full" disabled={submitting}>
+                {submitting ? 'Signing in...' : 'Sign in'}
+              </button>
+              {devError && <ErrorBanner message={devError} />}
+            </form>
           ) : (
             <>
               <p className="text-center text-sm text-gray-400">

@@ -19,8 +19,11 @@ from app.models.recording import Recording
 from app.models.audit import AuditLog, RiskEvent
 from app.models.vault_ref import VaultRef
 from app.models.notification import Notification
+from app.models.app_setting import AppSetting
+from app.models.risk_finding import RiskFinding
 
 __all__ = [
+    "RiskFinding",
     "Base",
     "User",
     "UserRole",
@@ -40,4 +43,5 @@ __all__ = [
     "RiskEvent",
     "VaultRef",
     "Notification",
+    "AppSetting",
 ]

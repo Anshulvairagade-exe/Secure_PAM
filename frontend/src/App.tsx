@@ -11,7 +11,15 @@ import AccessRequests from '@/pages/AccessRequests';
 import AccessRequestNew from '@/pages/AccessRequestNew';
 import AccessRequestDetail from '@/pages/AccessRequestDetail';
 import ApprovalsPage from '@/pages/Approvals';
-import ComingSoon from '@/pages/ComingSoon';
+import AuditLogs from '@/pages/AuditLogs';
+import VaultReferences from '@/pages/VaultReferences';
+import Sessions from '@/pages/Sessions';
+import AdminSessions from '@/pages/AdminSessions';
+import Recordings from '@/pages/Recordings';
+import SettingsPage from '@/pages/SettingsPage';
+import Users from '@/pages/Users';
+import Roles from '@/pages/Roles';
+import RiskCenter from '@/pages/RiskCenter';
 import NotFound from '@/pages/NotFound';
 
 export default function App() {
@@ -30,7 +38,15 @@ export default function App() {
         <Route path="/access-requests" element={<AccessRequests />} />
         <Route path="/access-requests/new" element={<AccessRequestNew />} />
         <Route path="/access-requests/:id" element={<AccessRequestDetail />} />
-        <Route path="/sessions" element={<ComingSoon title="My Sessions" phase="Phase 8" />} />
+        <Route path="/sessions" element={<Sessions />} />
+        <Route
+          path="/admin/sessions"
+          element={
+            <ProtectedRoute requiredRoles={['ADMIN']}>
+              <AdminSessions />
+            </ProtectedRoute>
+          }
+        />
         <Route path="/assets" element={<Assets />} />
         <Route path="/applications" element={<Applications />} />
         <Route
@@ -45,7 +61,7 @@ export default function App() {
           path="/recordings"
           element={
             <ProtectedRoute requiredRoles={['ADMIN', 'AUDITOR']}>
-              <ComingSoon title="Recording Center" phase="Phase 10 / 14" />
+              <Recordings />
             </ProtectedRoute>
           }
         />
@@ -53,7 +69,7 @@ export default function App() {
           path="/audit"
           element={
             <ProtectedRoute requiredRoles={['ADMIN', 'AUDITOR']}>
-              <ComingSoon title="Audit Logs" phase="Phase 15" />
+              <AuditLogs />
             </ProtectedRoute>
           }
         />
@@ -61,7 +77,7 @@ export default function App() {
           path="/risk"
           element={
             <ProtectedRoute requiredRoles={['ADMIN', 'APPROVER', 'AUDITOR']}>
-              <ComingSoon title="Risk Center" phase="Phase 5" />
+              <RiskCenter />
             </ProtectedRoute>
           }
         />
@@ -77,7 +93,7 @@ export default function App() {
           path="/vault"
           element={
             <ProtectedRoute requiredRoles={['ADMIN']}>
-              <ComingSoon title="Vault References" phase="Phase 7" />
+              <VaultReferences />
             </ProtectedRoute>
           }
         />
@@ -85,7 +101,7 @@ export default function App() {
           path="/users"
           element={
             <ProtectedRoute requiredRoles={['ADMIN']}>
-              <ComingSoon title="Users" phase="Phase 3" />
+              <Users />
             </ProtectedRoute>
           }
         />
@@ -93,11 +109,11 @@ export default function App() {
           path="/roles"
           element={
             <ProtectedRoute requiredRoles={['ADMIN']}>
-              <ComingSoon title="Roles" phase="Phase 3" />
+              <Roles />
             </ProtectedRoute>
           }
         />
-        <Route path="/settings" element={<ComingSoon title="Settings" phase="Phase 16" />} />
+        <Route path="/settings" element={<SettingsPage />} />
       </Route>
 
       <Route path="*" element={<NotFound />} />

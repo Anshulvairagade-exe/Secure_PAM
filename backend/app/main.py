@@ -39,15 +39,19 @@ async def _keycloak_mfa_sync_loop() -> None:
 
     while True:
         try:
+            stats: dict = {}
             async with async_session_factory() as db:
                 imported = await sync_keycloak_mfa_failures(
                     db,
                     lookback_hours=settings.KEYCLOAK_MFA_SYNC_LOOKBACK_HOURS,
+                    stats=stats,
                 )
 
+            # fetched / otp_failures / already_imported make a zero import explainable.
             logger.info(
                 "keycloak_mfa_sync_completed",
                 imported_count=imported,
+                **{k: v for k, v in stats.items() if k != "imported"},
             )
         except asyncio.CancelledError:
             raise
@@ -55,6 +59,28 @@ async def _keycloak_mfa_sync_loop() -> None:
             logger.exception("keycloak_mfa_sync_failed")
 
         await asyncio.sleep(interval)
+
+async def _recording_reconcile_loop() -> None:
+    """Fail recordings that no gateway will finalize (see app.services.recording_reconciler)."""
+    from app.services import risk_detector
+    from app.services.recording_reconciler import reconcile_stale_recordings
+
+    tick = 0
+    while True:
+        try:
+            async with async_session_factory() as db:
+                failed = await reconcile_stale_recordings(db)
+            if failed:
+                logger.warning("recordings_reconciled_failed", count=len(failed))
+            if tick % 5 == 0:  # Risk Centre findings every 5 minutes
+                async with async_session_factory() as db:
+                    logger.info("risk_evaluated", **(await risk_detector.evaluate(db)))
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("background_maintenance_failed")
+        tick += 1
+        await asyncio.sleep(60)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -75,7 +101,7 @@ async def lifespan(app: FastAPI):
         logger.info("db_tables_created", mode="DEV_MODE")
 
         # Seed default data
-        await _seed_default_data()
+        await _seed_default_data(include_sample_targets=settings.SEED_SAMPLE_TARGETS)
 
     mfa_sync_task = None
 
@@ -85,10 +111,17 @@ async def lifespan(app: FastAPI):
     ):
         mfa_sync_task = asyncio.create_task(_keycloak_mfa_sync_loop())
         logger.info("keycloak_mfa_sync_started")
+    reconcile_task = None
+    if settings.ENVIRONMENT != "test":
+        reconcile_task = asyncio.create_task(_recording_reconcile_loop())
     app.state.rate_limiter = RedisRateLimiter(settings.REDIS_URL)
     try:
         yield
     finally:
+        if reconcile_task is not None:
+            reconcile_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await reconcile_task
         if mfa_sync_task is not None:
             mfa_sync_task.cancel()
             with suppress(asyncio.CancelledError):
@@ -271,7 +304,8 @@ async def security_headers_middleware(request: Request, call_next):
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
     """Pydantic/FastAPI request validation failures — 422."""
-    logger.info("validation_failed", errors=exc.errors())
+    # Never log "input"/"ctx": they carry the submitted value (e.g. a rejected password).
+    logger.info("validation_failed", errors=[{"loc": e.get("loc"), "type": e.get("type")} for e in exc.errors()])
     return JSONResponse(
         status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
         content={
@@ -328,8 +362,9 @@ app.include_router(api_router, prefix=settings.API_V1_PREFIX)
 
 # --- Database Seeding ---
 
-async def _seed_default_data():
-    """Seed default roles, permissions, and dev users."""
+async def _seed_default_data(include_sample_targets: bool = False):
+    """Seed default roles, permissions, dev users and policies; sample
+    targets only when include_sample_targets (tests, SEED_SAMPLE_TARGETS)."""
     from app.database.session import async_session_factory
     from app.models.role import Permission, Role
     from app.models.user import User, UserRole
@@ -528,164 +563,169 @@ async def _seed_default_data():
             )
             db.add(user_role)
 
-        # --- Seed Sample Assets ---
-        from app.models.asset import Asset
+        # --- Sample targets (opt-in) ---
+        # Fictional assets and applications (*.internal hostnames that do not
+        # exist). They are test fixtures and an optional demo aid, never seeded
+        # by default: a real deployment registers its own targets.
+        if include_sample_targets:
+            # --- Seed Sample Assets ---
+            from app.models.asset import Asset
 
-        sample_assets = [
-            Asset(
-                name="WIN-PROD-01",
-                hostname="win-prod-01.internal",
-                ip_address="10.0.1.10",
-                port=3389,
-                protocol="RDP",
-                asset_type="WINDOWS_SERVER",
-                environment="PRODUCTION",
-                criticality="HIGH",
-                description="Production Windows Server — Domain Controller",
-                status="ACTIVE",
-                enabled=True,
-                owner="Infrastructure Team",
-                recording_required=True,
-                approval_required=True,
-                jit_required=True,
-            ),
-            Asset(
-                name="WIN-DEV-01",
-                hostname="win-dev-01.internal",
-                ip_address="10.0.2.10",
-                port=3389,
-                protocol="RDP",
-                asset_type="WINDOWS_WORKSTATION",
-                environment="DEVELOPMENT",
-                criticality="LOW",
-                description="Development Windows Workstation",
-                status="ACTIVE",
-                enabled=True,
-                owner="Development Team",
-                recording_required=False,
-                approval_required=False,
-                jit_required=True,
-            ),
-            Asset(
-                name="LINUX-PROD-01",
-                hostname="linux-prod-01.internal",
-                ip_address="10.0.1.20",
-                port=22,
-                protocol="SSH",
-                asset_type="LINUX_SERVER",
-                environment="PRODUCTION",
-                criticality="HIGH",
-                description="Production Linux Server — Application Host",
-                status="ACTIVE",
-                enabled=True,
-                owner="DevOps Team",
-                recording_required=True,
-                approval_required=True,
-                jit_required=True,
-            ),
-            Asset(
-                name="LINUX-DEV-01",
-                hostname="linux-dev-01.internal",
-                ip_address="10.0.2.20",
-                port=22,
-                protocol="SSH",
-                asset_type="LINUX_SERVER",
-                environment="DEVELOPMENT",
-                criticality="MEDIUM",
-                description="Development Ubuntu Server",
-                status="ACTIVE",
-                enabled=True,
-                owner="Development Team",
-                recording_required=False,
-                approval_required=False,
-                jit_required=True,
-            ),
-            Asset(
-                name="LINUX-STAGING-01",
-                hostname="linux-staging-01.internal",
-                ip_address="10.0.3.20",
-                port=22,
-                protocol="SSH",
-                asset_type="LINUX_SERVER",
-                environment="STAGING",
-                criticality="MEDIUM",
-                description="Staging Linux Server",
-                status="ACTIVE",
-                enabled=True,
-                owner="QA Team",
-                recording_required=True,
-                approval_required=False,
-                jit_required=True,
-            ),
-        ]
-        db.add_all(sample_assets)
+            sample_assets = [
+                Asset(
+                    name="WIN-PROD-01",
+                    hostname="win-prod-01.internal",
+                    ip_address="10.0.1.10",
+                    port=3389,
+                    protocol="RDP",
+                    asset_type="WINDOWS_SERVER",
+                    environment="PRODUCTION",
+                    criticality="HIGH",
+                    description="Production Windows Server — Domain Controller",
+                    status="ACTIVE",
+                    enabled=True,
+                    owner="Infrastructure Team",
+                    recording_required=True,
+                    approval_required=True,
+                    jit_required=True,
+                ),
+                Asset(
+                    name="WIN-DEV-01",
+                    hostname="win-dev-01.internal",
+                    ip_address="10.0.2.10",
+                    port=3389,
+                    protocol="RDP",
+                    asset_type="WINDOWS_WORKSTATION",
+                    environment="DEVELOPMENT",
+                    criticality="LOW",
+                    description="Development Windows Workstation",
+                    status="ACTIVE",
+                    enabled=True,
+                    owner="Development Team",
+                    recording_required=False,
+                    approval_required=False,
+                    jit_required=True,
+                ),
+                Asset(
+                    name="LINUX-PROD-01",
+                    hostname="linux-prod-01.internal",
+                    ip_address="10.0.1.20",
+                    port=22,
+                    protocol="SSH",
+                    asset_type="LINUX_SERVER",
+                    environment="PRODUCTION",
+                    criticality="HIGH",
+                    description="Production Linux Server — Application Host",
+                    status="ACTIVE",
+                    enabled=True,
+                    owner="DevOps Team",
+                    recording_required=True,
+                    approval_required=True,
+                    jit_required=True,
+                ),
+                Asset(
+                    name="LINUX-DEV-01",
+                    hostname="linux-dev-01.internal",
+                    ip_address="10.0.2.20",
+                    port=22,
+                    protocol="SSH",
+                    asset_type="LINUX_SERVER",
+                    environment="DEVELOPMENT",
+                    criticality="MEDIUM",
+                    description="Development Ubuntu Server",
+                    status="ACTIVE",
+                    enabled=True,
+                    owner="Development Team",
+                    recording_required=False,
+                    approval_required=False,
+                    jit_required=True,
+                ),
+                Asset(
+                    name="LINUX-STAGING-01",
+                    hostname="linux-staging-01.internal",
+                    ip_address="10.0.3.20",
+                    port=22,
+                    protocol="SSH",
+                    asset_type="LINUX_SERVER",
+                    environment="STAGING",
+                    criticality="MEDIUM",
+                    description="Staging Linux Server",
+                    status="ACTIVE",
+                    enabled=True,
+                    owner="QA Team",
+                    recording_required=True,
+                    approval_required=False,
+                    jit_required=True,
+                ),
+            ]
+            db.add_all(sample_assets)
 
-        # --- Seed Sample Applications ---
-        from app.models.application import Application
+            # --- Seed Sample Applications ---
+            from app.models.application import Application
 
-        sample_apps = [
-            Application(
-                name="Admin Portal",
-                description="Internal administration dashboard — HIGH risk",
-                target_url="https://admin.internal:8443",
-                protocol="HTTPS",
-                hostname="admin.internal",
-                port=8443,
-                environment="PRODUCTION",
-                criticality="HIGH",
-                access_mode="ISOLATED_BROWSER",
-                approval_required=True,
-                mfa_required=True,
-                recording_required=True,
-                download_allowed=False,
-                upload_allowed=False,
-                clipboard_allowed=False,
-                session_timeout=30,
-                status="ACTIVE",
-                enabled=True,
-            ),
-            Application(
-                name="Monitoring Dashboard",
-                description="Grafana monitoring dashboard",
-                target_url="http://monitoring.internal:3000",
-                protocol="HTTP",
-                hostname="monitoring.internal",
-                port=3000,
-                environment="PRODUCTION",
-                criticality="LOW",
-                access_mode="STANDARD_PROXY",
-                approval_required=False,
-                mfa_required=False,
-                recording_required=False,
-                download_allowed=True,
-                upload_allowed=False,
-                clipboard_allowed=True,
-                session_timeout=60,
-                status="ACTIVE",
-                enabled=True,
-            ),
-            Application(
-                name="CI/CD Pipeline",
-                description="Jenkins CI/CD server",
-                target_url="https://jenkins.internal:8080",
-                protocol="HTTPS",
-                hostname="jenkins.internal",
-                port=8080,
-                environment="STAGING",
-                criticality="MEDIUM",
-                access_mode="STANDARD_PROXY",
-                approval_required=False,
-                mfa_required=True,
-                recording_required=False,
-                download_allowed=True,
-                upload_allowed=True,
-                clipboard_allowed=True,
-                session_timeout=60,
-                status="ACTIVE",
-                enabled=True,
-            ),
-        ]
-        db.add_all(sample_apps)
+            sample_apps = [
+                Application(
+                    name="Admin Portal",
+                    description="Internal administration dashboard — HIGH risk",
+                    target_url="https://admin.internal:8443",
+                    protocol="HTTPS",
+                    hostname="admin.internal",
+                    port=8443,
+                    environment="PRODUCTION",
+                    criticality="HIGH",
+                    access_mode="ISOLATED_BROWSER",
+                    approval_required=True,
+                    mfa_required=True,
+                    recording_required=True,
+                    download_allowed=False,
+                    upload_allowed=False,
+                    clipboard_allowed=False,
+                    session_timeout=30,
+                    status="ACTIVE",
+                    enabled=True,
+                ),
+                Application(
+                    name="Monitoring Dashboard",
+                    description="Grafana monitoring dashboard",
+                    target_url="http://monitoring.internal:3000",
+                    protocol="HTTP",
+                    hostname="monitoring.internal",
+                    port=3000,
+                    environment="PRODUCTION",
+                    criticality="LOW",
+                    access_mode="STANDARD_PROXY",
+                    approval_required=False,
+                    mfa_required=False,
+                    recording_required=False,
+                    download_allowed=True,
+                    upload_allowed=False,
+                    clipboard_allowed=True,
+                    session_timeout=60,
+                    status="ACTIVE",
+                    enabled=True,
+                ),
+                Application(
+                    name="CI/CD Pipeline",
+                    description="Jenkins CI/CD server",
+                    target_url="https://jenkins.internal:8080",
+                    protocol="HTTPS",
+                    hostname="jenkins.internal",
+                    port=8080,
+                    environment="STAGING",
+                    criticality="MEDIUM",
+                    access_mode="STANDARD_PROXY",
+                    approval_required=False,
+                    mfa_required=True,
+                    recording_required=False,
+                    download_allowed=True,
+                    upload_allowed=True,
+                    clipboard_allowed=True,
+                    session_timeout=60,
+                    status="ACTIVE",
+                    enabled=True,
+                ),
+            ]
+            db.add_all(sample_apps)
 
         # --- Seed Default Policies ---
         from app.models.policy import Policy

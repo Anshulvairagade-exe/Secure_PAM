@@ -487,6 +487,53 @@ outside `securepam/assets/` → 403; `sys/mounts`, `sys/policies`, `sys/auth`,
 `-no-default-policy`: the CLI's preflight `sys/internal/ui/mounts/...`
 lookup is allowed for any token holding a capability under the mount.
 
+### OpenBao on AWS (production)
+
+The lab server above is in-memory, plain HTTP, and auto-unsealed — never
+production. The production deployment lives in
+`infrastructure/openbao/aws/` and is fully separate from local development:
+
+| Piece | File |
+|---|---|
+| Server config (Raft, private bind, TLS, KMS seal) | `infrastructure/openbao/aws/bao-config.hcl` |
+| App policy: read-only, exact win11-lab + kali paths | `infrastructure/openbao/aws/policies/securepam-app.hcl` |
+| Writer policy: update-only on the same two paths | `infrastructure/openbao/aws/policies/securepam-writer.hcl` |
+| EC2 + SG + IAM + KMS + Secrets Manager + NLB + DNS | `infrastructure/openbao/aws/terraform/` |
+| Idempotent provision/rotate/verify tooling | `backend/scripts/openbao_aws_provision.py`, `infrastructure/openbao/aws/provision/provision.sh` |
+| Full operator runbook | `infrastructure/openbao/aws/README.md` |
+
+Architecture (single private node, no public ingress, no SSH — admin over
+SSM): SecurePAM backends → TLS → internal NLB :443 (TCP passthrough) →
+EC2 :8200 (OpenBao, Let's Encrypt cert for the private DNS name, Raft on
+encrypted EBS). Auto-unseal via the KMS `awskms` plugin using the instance
+role (no static AWS credentials); file audit device shipped to
+CloudWatch. backend config is one static change:
+
+```bash
+SECRET_PROVIDER=openbao
+OPENBAO_ADDR=https://bao.<your-zone>   # https enforced when ENVIRONMENT=production
+OPENBAO_TOKEN=<restricted app token from Secrets Manager>
+OPENBAO_CA_CERT=                        # empty: public LE chain verifies with system CAs
+```
+
+Operator flow (details + IAM JSON + backup/recovery in `aws/README.md`):
+`terraform apply` → `provision.sh` (detects init state, never
+reinitialises; mints 24h app + 1h writer orphan tokens into 0600 files) →
+`provision.sh --verify-only` (reuses the token verifier: exact policy,
+capabilities, real reads, denied write probe) → `--push-secrets` →
+restrict the bootstrap credential. Credentials for win11-lab/kali are
+stored with `--set-credential` (hidden prompt, writer identity only);
+tokens rotate with `--rotate app|writer` (new token verified before the
+old is revoked — no restart). Asset references in SecurePAM are unchanged,
+admin-only, allowlisted, and audited; every OpenBao failure (sealed,
+unreachable, TLS error, denied, expired token) fails closed.
+
+Status: the Terraform, config, policies, provisioner and verifier are
+implemented and unit-tested with mocks, but **not yet run against real
+AWS** — do not claim the deployment works until bootstrap + `--verify-only`
+succeed in the target account (remaining prerequisites are listed in
+`aws/README.md` §1).
+
 ### Troubleshooting a 403 from `bao kv get`
 
 The error text tells you which layer refused:
@@ -532,6 +579,13 @@ and the real gateway must tear down the connection when a session leaves a
 live state.
 
 ### Remaining production-hardening requirements
+
+Update: the AWS deployment in `infrastructure/openbao/aws/` now implements
+the Raft/TLS/seal, audit-device, and rotation items below (single-node;
+untested against real AWS so far — see
+[OpenBao on AWS](#openbao-on-aws-production)). Still open: machine auth
+(AppRole/JWT instead of static rotated tokens), token-renewal loop, MFA at
+checkout, dynamic secrets, connection pooling.
 
 The local `bao server -dev` instance is **not** production: it is
 in-memory, auto-unsealed, plain HTTP, and its root token is printed to the
@@ -735,6 +789,79 @@ on the schema (every schema in `app/schemas/{assets,applications,policies}.py`
 already does this) so `.model_dump()` yields plain strings before they
 reach the ORM constructor.
 
+## Local lab operations (verified 2026-10-15)
+
+Local-only. Nothing here touches AWS, restarts OpenBao, or deletes data.
+The AWS deployment in `infrastructure/openbao/aws/` is separate and
+undeployed; behavior below was verified against the running lab, not
+claimed from unit tests.
+
+### Services and URLs
+
+| Service | URL | Notes |
+|---|---|---|
+| Frontend (vite dev) | http://127.0.0.1:3000 | Serves `frontend/src` live; no rebuild needed |
+| Backend API + Swagger | http://127.0.0.1:8000, `/docs` | Restart to load code changes (see below) |
+| Keycloak | http://localhost:8080 (`/admin` = master console — use `localhost`, not `127.0.0.1`: the server's hostname is `localhost`, and the admin console hangs on "Loading the Admin UI" from the other origin) | Container `securepam-keycloak`; realm `securepam` |
+| OpenBao dev | http://127.0.0.1:18200 (sealed=false, in-memory) | **Never restart/reinit**: secrets live only in memory |
+| guacd / Guacamole | 127.0.0.1:4822 / 127.0.0.1:8081 | RDP gateway + recordings |
+| Browser isolation daemon | http://127.0.0.1:6090 (loopback mgmt API) | Per-session VNC on 127.0.0.1:5910+ |
+
+PostgreSQL and Redis run on the Mac host (Homebrew). Docker holds only
+Keycloak (+postgres), Guacamole stack, and browser-isolation.
+
+### Safe start/stop
+
+```bash
+# Validate compose before touching anything (starts nothing):
+docker compose -f docker-compose.yml -f docker-compose.keycloak.yml --profile lab config > /dev/null
+# Backend (from repo root; env names only — values from files/process, never logged):
+SECRET_PROVIDER=openbao OPENBAO_ADDR=http://127.0.0.1:18200 \
+  OPENBAO_TOKEN="$(cat ~/.securepam/openbao-app-token)" \
+  SECUREPAM_KNOWN_HOSTS_PATH=<scratchpad>/ssh/known_hosts \
+  RECORDING_STORAGE_PATH=<scratchpad>/recordings-live RDP_RECORDING_PATH=<scratchpad>/recordings-live/rdp \
+  RDP_GATEWAY_ENABLED=true GUACD_HOST=127.0.0.1 GUACD_PORT=4822 REDIS_URL=redis://127.0.0.1:6379/0 \
+  BROWSER_ISOLATION_ENABLED=true BROWSER_ISOLATION_TOKEN_FILE=$PWD/infrastructure/browser-isolation/.isolation_token \
+  KEYCLOAK_INTERNAL_URL=http://127.0.0.1:8080 \
+  KEYCLOAK_AUDIT_CLIENT_SECRET_FILE=$HOME/.securepam/keycloak-audit-reader.secret \
+  KEYCLOAK_MFA_SYNC_ENABLED=true \
+  nohup backend/.venv/bin/python backend/.venv/bin/uvicorn app.main:app \
+  --host 127.0.0.1 --port 8000 --app-dir backend >> ~/.securepam/backend.log 2>&1 &
+# Frontend needs no restart (vite serves disk state); backend MUST be restarted after code changes.
+# Migrations: `cd backend && ../backend/.venv/bin/python -m alembic current` must print the head
+# (currently d4e5f6a7b8c9 risk_findings); `upgrade head` only if behind. Never downgrade/reset dev data.
+# NEVER: docker compose down -v, bao operator init, OpenBao restart, realm/secret deletion.
+```
+
+### Keycloak MFA (local realm `securepam`)
+
+- The realm's browser flow is bound to **SecurePAM Browser MFA** (username/password REQUIRED, OTP REQUIRED). Users without an enrolled authenticator are forced through `CONFIGURE_TOTP` (a realm default action) — no bypass. Service-account/client-credentials flows use the separate `clients` flow and are unaffected (verified: token grant works).
+- The `securepam-audit-reader` service account holds **only** `realm-management/view-events` (verified live: `events` 200, `users`/`clients` 403). Its secret lives 0600 at `~/.securepam/keycloak-audit-reader.secret` and is wired via `KEYCLOAK_AUDIT_CLIENT_SECRET_FILE`.
+- To enroll a test account: Keycloak admin console at http://localhost:8080/admin (NOT 127.0.0.1 — wrong origin hangs the console) → master login → `securepam` realm → Users → Add user (username, email, temporary password OFF not needed) → Credentials → set password (temporary OFF) → sign in once at the SecurePAM frontend via Keycloak → scan the QR with Google/Microsoft Authenticator → enter the 6-digit code. Valid code succeeds; wrong code/password is rejected as `invalid_grant` (not misclassified — Keycloak distinguishes `invalid_user_credentials` from OTP errors).
+- OTP failures surface as Keycloak `LOGIN_ERROR` events → backend MFA sync (60s loop, `keycloak_mfa_sync_started/completed` in `backend.log`) → `MFA_FAILURE` audit rows → Risk Centre `MFA_FAILURES` rule. Re-syncs are idempotent (verified by test, no duplicates).
+- Admin console access needs the Keycloak `kcadmin` password (set at container creation; not stored in this repo — ask the environment owner; never commit it).
+
+### Local OpenBao reader/writer
+
+- Reader (`~/.securepam/openbao-app-token`, `securepam-read` policy): verified with `backend/scripts/verify_openbao_token.py` — read-only on exactly `securepam/assets/kali` and `securepam/assets/win11-lab` (both return `username`+`password` fields), deny everywhere else, writes denied. Backend `/health/detailed` shows the token fingerprint (never the token).
+- Writer: **configured locally** via `OPENBAO_WRITER_TOKEN_FILE` (`~/.securepam/openbao-writer-token`, 0600, outside the repo) on the `securepam-writer` policy (create+update on the registered paths only — verified: read/delete/sys/token-mint all denied; `GET /credential-provisioning/status` reports `configured:true`). Limitations: the token is local-only with ~24h TTL (re-mint + backend restart when it expires; rotation procedure in `infrastructure/openbao/aws/README.md`); it is a separate identity from the reader (startup refuses equality); teammates must mint their own local writer token — this setup does not transfer. AWS deployment has not occurred. Provisioning/rotation endpoints fail closed (`503 PROVISIONING_NOT_CONFIGURED`, `written_version:null`, existing references untouched — verified live).
+- Asset credentials: `credential-ref/check` reports `ok` for Kali; check responses never contain secrets. Local OpenBao UI: none configured (`openbao_ui_url:null`); do not publish port 8200.
+
+### Health, features, and fallbacks
+
+- Health: `/health` (liveness), `/health/detailed` (authed; per-service incl. OpenBao fingerprint, gateways, recording storage).
+- Admin Users (`/users`, ADMIN): create/edit/deactivate verified live; responses never contain hashes; self-deactivation refused; last-admin protection is unit-tested.
+- Settings (`/settings`, `PUT /settings/session-policy`): values persist and revert (verified 2→3→2).
+- Risk Centre (`/risk`, `/risk/summary`): findings come from real audit rows via deterministic rules; API totals match `risk_findings` exactly (currently 9 OPEN / 5 RESOLVED).
+- Recordings: server-side completion + SHA-256 verified before streaming; replay is auditor/admin-only (operator gets 403 — verified). Isolated-browser sessions carry no recording artifact by design (launch is refused when recording is required); use session/audit logs as the fallback there.
+- Theme: light/dark/system toggle, persisted in `localStorage`, applied pre-paint (`public/theme-init.js`, no flash) — verified across reload.
+
+### Recovery
+
+- Backend won't start: read the tail of `~/.securepam/backend.log`; missing `OPENBAO_TOKEN`/`OPENBAO_ADDR` fails fast with `SettingsError` (never silent mock fallback).
+- Keycloak realm misconfigured: the change surface is one DB row (`realm.browser_flow`); master realm always stays usable for recovery. Never import old realm exports (they carry signing keys, hashes, TOTP seeds).
+- OpenBao sealed/unreachable: backends fail closed; do NOT reinit (destroys in-memory secrets) — restart only the `bao server -dev` process if it died, then re-run provisioning per `infrastructure/openbao/init-lab.sh` semantics.
+
 ## Status
 
 Implemented and tested: project scaffolding, Docker Compose, all 17
@@ -758,11 +885,128 @@ Phase 5 adds OpenBao KV v2 credential references and `CredentialService`
 (authorized, audited, backend-only retrieval for future gateways) — see
 [Credential management (OpenBao)](#credential-management-openbao).
 
-Not implemented: Keycloak/OIDC, OpenBao rotation/dynamic secrets, Guacamole (RDP), SSH
-gateway, web reverse proxy, isolated browser, session recording,
-Wazuh/SIEM, Users/Roles CRUD, a JIT REST endpoint (deliberately — see
-the JIT lifecycle section above), and a background sweep for
-request-queue/JIT expiry (both are currently lazy — evaluated the next
-time something actually looks at the row, not on a timer). The UI still
-shows an honest "planned for Phase N" placeholder for Sessions/
-Recordings/Audit Logs/Risk Center/Vault/Users/Roles.
+### Sessions, recording and gateways (current)
+
+- **SSH is the one deployed gateway.** The browser terminal (xterm.js over
+  `/sessions/ssh/{id}/ws`) is bridged by an in-process AsyncSSH gateway:
+  one-time ticket (first WebSocket frame, never the URL), host-key pinning
+  (`SECUREPAM_KNOWN_HOSTS_PATH`), server-side credential injection from
+  OpenBao, and a monitor that re-reads the session, grant, request, user
+  and asset every second and closes the real connection on termination,
+  expiry, revocation or deactivation.
+- **Recording** is a server-side asciicast v2 file (terminal output and
+  resizes; keystrokes are not captured) under `RECORDING_STORAGE_PATH`
+  (mode 0600, never served statically). A recording is `COMPLETED` only
+  when the recorder ran and its file was closed and SHA-256 hashed; if
+  required recording cannot start or fails mid-session, the session is
+  refused or ended. `POST /sessions/{id}/terminate` never marks a
+  recording complete — the gateway that owns the recorder finalizes it,
+  and a recording that never started is marked `FAILED`.
+- **RDP goes through Apache Guacamole's guacd** (`infrastructure/guacamole/compose.yml`, Guacamole 1.6.0).
+  SecurePAM's backend speaks the Guacamole protocol to guacd directly — exactly what Guacamole's own web
+  app does for a browser — so no Guacamole admin API, token or database password is involved in a session
+  and the Windows credential is never stored in Guacamole. Launch validates request/grant/asset/limit and
+  checks the credential out; the browser then redeems a one-time ticket on
+  `/sessions/rdp/{id}/ws` (first frame, never the URL). The backend re-validates, hands guacd the target
+  (always the registered asset) and credential, relays the display/keyboard/mouse stream with an opcode
+  allowlist, and marks the session ACTIVE only after guacd's first real display update. The per-second
+  monitor (grant, request, user, asset, termination) closes guacd's connection, which ends the RDP
+  connection. Termination, admin terminate-all, grant revocation and the two-session limit are the same
+  code paths as SSH.
+- **RDP recording** is guacd's own recording (`recording-path` per session, keystrokes excluded) on a bind
+  mount the backend reads. Required recording must exist before any desktop frame is forwarded. After the
+  connection closes the artifact is inspected: it is COMPLETED only if it exists inside the RDP recording
+  root, is a well-formed Guacamole stream **with display frames**, and has been SHA-256 hashed; otherwise
+  FAILED with the reason audited. Playback verifies the hash on every request. A screen recording does not
+  prove which commands ran; Windows command attribution needs event telemetry (4688, PowerShell 4104,
+  Sysmon), which is not integrated.
+- **RDP configuration:** `RDP_GATEWAY_ENABLED=true`, `GUACD_HOST=127.0.0.1`, `GUACD_PORT=4822`,
+  `RDP_RECORDING_PATH` (= the directory bind-mounted at `/recordings` into guacd; defaults to
+  `<RECORDING_STORAGE_PATH>/rdp`). Security: `RDP_SECURITY=nla`; `RDP_IGNORE_CERT=true` because Windows
+  lab servers use self-signed certificates (NLA/CredSSP still authenticates the exchange, but the
+  certificate chain is not validated — set false and install a trusted certificate for production).
+  guacd has no authentication of its own: it is published on `127.0.0.1` only, and anything able to reach
+  it could drive RDP connections, so never expose that port.
+- **Starting Guacamole:** `cd infrastructure/guacamole && docker compose up -d` (`.env` holds
+  `GUAC_RECORDINGS_DIR`; the secret files `.db_password`, `.owner_password`, `.admin_password` are
+  git-ignored). The image has no `*_FILE` support, so the entrypoint reads the DB password from the secret
+  file; the schema/roles/admin password are applied only on a fresh database, and the stock
+  `guacadmin/guacadmin` credential is replaced before the database accepts connections. Web UI:
+  `http://127.0.0.1:8081/guacamole/` (loopback only; admin password in `.admin_password`).
+- **Remote-desktop architecture decision (Guacamole/guacd kept; noVNC rejected).** Evidence from the live
+  lab: the guacd path already delivers a real NLA-authenticated RDP connection, real Windows frames, key and
+  mouse events, recordings that replay in the browser, admin termination and grant revocation. The only
+  blocker observed was Windows' single-session rule ("Another user is signed in"), which a VNC server would
+  not solve: a Windows VNC server attaches to the *console* session, so it shows whoever is signed in there,
+  bypasses per-user Windows authentication, needs third-party software installed on every endpoint, and adds
+  a network service to firewall and authenticate, plus a second recording format. Guacamole's own web client
+  was also not adopted: it would put a Guacamole token and UI in the browser, whereas SecurePAM keeps the
+  browser on its own one-time-ticket WebSocket and holds the credential server-side.
+- **ACTIVE is not "desktop reached".** A session becomes ACTIVE when guacd delivers real display frames,
+  which can be the Windows sign-in, lock or "another user is signed in" screen. guacd does not report
+  Windows logon completion, so desktop reachability is verified visually, never inferred from frames.
+- **Recording playback** replays the hash-verified artifact through a replay-only tunnel: guacamole-common-js
+  1.5.0's `SessionRecording(Blob)` path throws (`reading 'size'`) and left the player blank. Replay never
+  opens a session or sends input. A recording whose hash matches but contains no display frames is reported
+  `no_display_data` and is not served.
+- **HTTP/HTTPS applications open in an isolated browser** (`infrastructure/browser-isolation`, applications
+  with access mode `ISOLATED_BROWSER`). It is not a proxy: the application runs in a disposable Chromium inside
+  a container, and the operator's browser only receives pixels (noVNC) and sends keyboard/mouse input. Cookies,
+  storage and downloads never reach the operator's machine. Flow: launch validates the request, grant, application
+  and session limit; the backend asks the isolation daemon to open **the registered destination only** (scheme,
+  host, port and `start_path` from the application row; the client cannot pass a URL), and waits until the page
+  is on the registered origin. The browser then redeems a one-time ticket on `/sessions/web/{id}/ws` (first frame).
+  The backend authenticates to that session's x11vnc with a per-session random password, gives noVNC an
+  already-authenticated stream, and relays it through an RFB message allowlist (`ClientMessageFilter`):
+  SetEncodings is reduced to plain display encodings, and clipboard is dropped unless the application allows it.
+  The per-second monitor (session, grant, request, user, application) ends the browser on termination, expiry
+  or revocation, and the daemon deletes the profile and kills the session's processes.
+- **Destination control.** Each session's Chromium uses a per-session egress proxy that allows only the
+  registered `host:port`, connects to the IP resolved at launch (no DNS rebinding) and always refuses loopback,
+  link-local, cloud metadata and multicast. Navigations or requests elsewhere (including Chromium's own calls to
+  Google) are blocked and audited as `DESTINATION_DENIED`. Chromium policy (`policies.json`) disables
+  certificate-error override, downloads, DevTools and non-proxied WebRTC UDP.
+- **TLS fails closed.** The daemon validates the certificate before launching Chromium. An invalid certificate
+  ends the launch with `TLS_VALIDATION_FAILED` unless the application has an explicit **key pin**
+  (`tls_pin_sha256`, base64 SHA-256 of the server's SubjectPublicKeyInfo). Only that exact key is then
+  accepted (Chromium `--ignore-certificate-errors-spki-list` plus the daemon's own check); any other
+  certificate, including a different self-signed one, is refused. Compute the pin on the server itself,
+  out of band, not from a network handshake:
+  `openssl x509 -in <dashboard cert> -pubkey -noout | openssl pkey -pubin -outform der | openssl dgst -sha256 -binary | base64`.
+  The pin is the right approach for a self-signed lab dashboard; for production, install a certificate
+  that validates normally and leave the pin empty.
+- **Application credentials are never handled.** The operator signs in to the application in the isolated
+  browser; SecurePAM does not store, inject or see those credentials.
+- **Running it:** `cd infrastructure/browser-isolation && docker compose up -d --build`. Generate
+  `.isolation_token` first (0600, git-ignored), e.g. `umask 077; openssl rand -hex 32 > .isolation_token`.
+  Backend: `BROWSER_ISOLATION_ENABLED=true`, `BROWSER_ISOLATION_URL=http://127.0.0.1:6090`,
+  `BROWSER_ISOLATION_TOKEN_FILE=<path to .isolation_token>`. The container is read-only, runs as UID 1000
+  with all capabilities dropped, has an init process to reap Chromium's orphans, and publishes its API and
+  VNC ports on 127.0.0.1 only. Never expose them.
+- **Isolated-browser limits:** Chromium runs with `--no-sandbox`, so the container is the security boundary
+  (do not loosen its settings). The VNC password registry lives in the backend process, so run one backend
+  worker. Web sessions are **not recorded**, so an application that requires recording is refused rather
+  than opened unrecorded. The watermark deters screenshots but cannot prevent them.
+- **SIEM events.** Every audit event is also written as one redacted JSON line (`{"securepam": {...}}`; no
+  tokens, passwords, tickets or credentials) to `SIEM_EVENT_LOG_PATH` (0600). To ship to Wazuh, use the real
+  ingestion path, a Wazuh agent on the backend host reading that file, never the dashboard:
+  `<localfile><log_format>json</log_format><location>/path/to/siem-events.json</location></localfile>` in the
+  agent's `ossec.conf`, plus rules for the `securepam.action` values you want to alert on (e.g.
+  `DESTINATION_DENIED`, `TLS_VALIDATION_FAILED`, `SESSION_TERMINATED`, `BROWSER_CLEANUP_FAILED`). An event is
+  written before its database commit, so a rare rolled-back action can still appear in the file.
+- The embedded terminal carries a persistent watermark (operator, session
+  number, live UTC time). It deters and attributes screenshots; it cannot
+  prevent screenshots or external capture.
+- Sample assets/applications are not seeded (`SEED_SAMPLE_TARGETS=false`).
+  To retire the old sample rows from an existing dev database:
+  `cd backend && .venv/bin/python -m scripts.retire_sample_targets [--apply]`.
+
+Not implemented: Keycloak/OIDC (DEV_MODE accounts only), OpenBao
+rotation/dynamic secrets, Windows command telemetry, a web reverse proxy
+(HTTP apps use the isolated browser instead), isolated-browser recording, a
+Wazuh agent/rule pack (the JSON event file is produced; shipping it is a host
+setup step), a recording-retention
+sweep, and a background sweep for request-queue/JIT expiry (lazy today —
+evaluated when something looks at the row; live SSH sessions are the
+exception, being checked every second). The UI shows an honest
+"planned" placeholder only for Risk Center, Users and Roles.

@@ -46,7 +46,7 @@ class HealthCheck(BaseModel):
 class ServiceHealth(BaseModel):
     """Individual service health."""
     service: str
-    status: str  # healthy, unhealthy, degraded
+    status: str  # healthy, degraded, unhealthy, mock, not_configured
     latency_ms: Optional[float] = None
     details: Optional[str] = None
 

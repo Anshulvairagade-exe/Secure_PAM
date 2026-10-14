@@ -8,6 +8,7 @@
 
 import axios, { AxiosError, InternalAxiosRequestConfig } from 'axios';
 import keycloak from '@/auth/keycloak';
+import { clearDevToken, getDevToken } from '@/auth/devSession';
 
 const API_BASE_URL = import.meta.env.VITE_API_URL || '';
 
@@ -23,7 +24,11 @@ const apiClient = axios.create({
 
 apiClient.interceptors.request.use(
   async (config: InternalAxiosRequestConfig) => {
-    if (keycloak.authenticated) {
+    const devToken = getDevToken();
+    if (devToken) {
+      // DEV_MODE backend: token issued by POST /auth/login (see auth/devSession).
+      config.headers.Authorization = `Bearer ${devToken}`;
+    } else if (keycloak.authenticated) {
       try {
         await keycloak.updateToken(30);
 
@@ -49,6 +54,9 @@ apiClient.interceptors.request.use(
 apiClient.interceptors.response.use(
   (response) => response,
   (error: AxiosError) => {
+    if (error.response?.status === 401) {
+      clearDevToken();
+    }
     if (
       error.response?.status === 401 &&
       window.location.pathname !== '/login'

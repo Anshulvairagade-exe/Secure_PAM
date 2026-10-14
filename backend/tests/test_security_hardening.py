@@ -20,6 +20,7 @@ from app.models.session import Session, SessionEvent
 from app.secret_providers import MockSecretProvider
 from app.services.credential_service import CredentialAccessDenied, CredentialService
 from app.services.jit_service import JITService
+from tests.conftest import auth_header
 from tests.test_credential_service import PASSWORD, PATH, _scenario
 
 STRONG_KEY = "k" * 48
@@ -103,9 +104,11 @@ async def test_ending_grant_ends_its_live_sessions(db_session, action, reason):
     assert starting.status == "EXPIRED"
     assert finished.status == "COMPLETED"  # already-ended sessions untouched
 
+    # The recording is NOT declared complete by the grant ending: only the gateway that holds the
+    # recorder can close and hash the artifact, so it is left for the gateway (or the reconciler).
     rec = await db_session.get(Recording, live.recording_id)
     await db_session.refresh(rec)
-    assert rec.status == "COMPLETED"
+    assert rec.status == "RECORDING"
 
     events = (await db_session.execute(
         select(SessionEvent).where(SessionEvent.event_type == "SESSION_ENDED_BY_GRANT")
@@ -149,10 +152,51 @@ async def test_revoked_grant_session_cannot_check_out_credentials(db_session):
 
 # --- health detail sanitization ----------------------------------------------
 
-async def test_health_does_not_leak_dependency_errors(client, monkeypatch):
+async def test_health_does_not_leak_dependency_errors(client, admin_token, monkeypatch):
     monkeypatch.setattr(settings, "REDIS_URL", "redis://leaky-internal-host.invalid:6399/0")
-    r = await client.get("/health/detailed")
+    r = await client.get("/health/detailed", headers=auth_header(admin_token))
     redis = next(s for s in r.json()["services"] if s["service"] == "redis")
     assert redis["status"] == "unhealthy"
     assert redis["details"] == "redis unreachable"
     assert "leaky-internal-host" not in r.text
+
+
+# --- recording finalization after a session ends without its gateway ----------
+
+async def test_reconciler_fails_unfinalized_recordings_after_grace_and_never_completes(db_session):
+    from datetime import timedelta
+    from app.models.audit import AuditLog
+    from app.services.recording_reconciler import GRACE_SECONDS, reconcile_stale_recordings
+
+    req = await _scenario(db_session)
+    orphan = await _live_session(db_session, req, with_recording=True)        # gateway never finalizes
+    finalized = await _live_session(db_session, req, with_recording=True)     # gateway finalized in time
+    pending = await _live_session(db_session, req, status="STARTING")
+    rec_pending = Recording(session_id=pending.id, recording_type="VIDEO", status="PENDING")
+    db_session.add(rec_pending)
+    await db_session.flush()
+    pending.recording_id = rec_pending.id
+    await db_session.commit()
+
+    grant = await db_session.get(JITGrant, req.jit_grant_id)
+    await JITService().revoke(db_session, grant)
+    await db_session.commit()
+    rec_fin = await db_session.get(Recording, finalized.recording_id)
+    rec_fin.status, rec_fin.file_hash = "COMPLETED", "a" * 64
+    await db_session.commit()
+
+    # Inside the grace window nothing is decided (a gateway may still be finalizing).
+    assert await reconcile_stale_recordings(db_session) == []
+    await db_session.refresh(orphan)
+    later = orphan.end_time + timedelta(seconds=GRACE_SECONDS + 1)
+    failed = await reconcile_stale_recordings(db_session, now=later)
+    assert set(failed) == {str(orphan.recording_id)}  # PENDING of a never-connected session was failed at once
+
+    for rid, want in ((orphan.recording_id, "FAILED"), (finalized.recording_id, "COMPLETED"),
+                      (rec_pending.id, "FAILED")):
+        r = await db_session.get(Recording, rid)
+        await db_session.refresh(r)
+        assert r.status == want
+    audits = (await db_session.execute(select(AuditLog).where(AuditLog.action == "RECORDING_FAILED"))).scalars().all()
+    assert [a.details["reason"] for a in audits] == ["RECORDING_NOT_FINALIZED"]
+    assert await reconcile_stale_recordings(db_session, now=later) == []  # idempotent

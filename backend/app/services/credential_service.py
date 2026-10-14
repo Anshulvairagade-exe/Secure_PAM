@@ -55,6 +55,7 @@ from app.models.session import Session
 from app.models.user import User
 from app.models.vault_ref import VaultRef
 from app.secret_providers import (
+    MalformedSecretError,
     Credential,
     InvalidSecretReferenceError,
     SecretProvider,
@@ -171,7 +172,7 @@ class CredentialService:
             field = SECRET_FIELDS.get(ref.secret_type)
             secret = record.data.get(field) if field else None
             if not isinstance(secret, str) or not secret:
-                raise SecretProviderError("Secret is missing its expected field")
+                raise MalformedSecretError(f"Secret has no {field or ref.secret_type} field")
             username = record.data.get("username") or ref.username
             credential = Credential(
                 username=username if isinstance(username, str) else None,

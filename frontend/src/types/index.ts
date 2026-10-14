@@ -156,6 +156,57 @@ export interface AccessRequest {
   expires_at?: string;
   decided_at?: string;
   decided_by?: string;
+  /** Only on GET /access-requests/{id}: the JIT grant issued for this request. */
+  jit_grant?: JITGrantSummary | null;
+}
+
+export type SecretType = 'PASSWORD' | 'SSH_KEY' | 'API_KEY' | 'CERTIFICATE';
+
+/** A pointer to a secret in the provider. Never carries the secret itself. */
+export interface CredentialRef {
+  id: string;
+  asset_id: string;
+  provider: string;
+  vault_path: string;
+  secret_type: SecretType;
+  username?: string | null;
+  secret_version?: number | null;
+  is_active: boolean;
+  last_rotated?: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface CredentialRefInput {
+  secret_name: string;
+  secret_type: SecretType;
+  username?: string;
+  secret_version?: number;
+}
+
+/** Result of POST /assets/{id}/credential-ref/check. Safe status + reason
+ *  only — never carries the secret value. */
+export type CredentialRefCheckStatus =
+  | 'ok'
+  | 'secret_not_found'
+  | 'access_denied'
+  | 'unavailable'
+  | 'malformed'
+  | 'no_reference';
+
+export interface CredentialRefCheck {
+  status: CredentialRefCheckStatus;
+  message: string;
+}
+
+export interface JITGrantSummary {
+  id: string;
+  protocol: string;
+  /** ACTIVE, EXPIRED or REVOKED; EXPIRED as soon as expires_at has passed. */
+  status: string;
+  granted_at: string;
+  expires_at: string;
+  revoked_at?: string | null;
 }
 
 export interface AccessRequestInput {
@@ -232,6 +283,29 @@ export interface Session {
   asset_name?: string;
   application_name?: string;
   user_name?: string;
+  recording_status?: Recording['status'] | null;
+  // FAILED sessions: stable reason code + safe message (backend-provided).
+  failure_reason?: string | null;
+  failure_message?: string | null;
+}
+
+/** POST /sessions/ssh/launch. The one-time ticket is sent in the first
+ * WebSocket frame, never in a URL. */
+export interface SSHLaunchResponse {
+  session_id: string;
+  session_number: string;
+  status: SessionStatus;
+  recording_id: string | null;
+  ticket: string;
+  ws_url: string;
+}
+
+/** POST /jit-grants/{id}/revoke. IDs and counts only — never credentials. */
+export interface GrantRevokeResult {
+  id: string;
+  status: string;
+  revoked_at: string | null;
+  sessions_ended: number;
 }
 
 // --- Recordings ---
@@ -244,6 +318,40 @@ export interface Recording {
   duration_seconds?: number;
   retention_date?: string;
   created_at: string;
+  session_number?: string | null;
+  operator_username?: string | null;
+  asset_name?: string | null;
+  protocol?: string | null;
+  started_at?: string | null;
+  ended_at?: string | null;
+  sha256?: string | null;
+  integrity: 'verified' | 'mismatch' | 'missing' | 'not_available' | 'no_display_data';
+  transcript_available?: boolean;
+  format?: 'asciicast' | 'guacamole' | null;
+}
+
+export interface SystemSettings {
+  environment: string;
+  version: string;
+  dev_mode: boolean;
+  authentication: string;
+  secret_provider: string;
+  jit_default_minutes: number;
+  jit_max_minutes: number;
+  session_default_timeout_minutes: number;
+  session_max_timeout_minutes: number;
+  rate_limit_per_minute: number;
+  rate_limit_login_per_minute: number;
+  recording_storage_writable: boolean;
+  recording_retention_days?: number | null;
+  ssh_recording_format: string;
+  managed_by: string;
+  mfa_provider: string;
+  mfa_self_service: boolean;
+  mfa_failure_sync_enabled: boolean;
+  siem_forwarding_enabled: boolean;
+  credential_provisioning_configured: boolean;
+  openbao_ui_configured: boolean;
 }
 
 // --- Audit ---
@@ -315,7 +423,7 @@ export interface HealthCheck {
 
 export interface ServiceHealth {
   service: string;
-  status: 'healthy' | 'unhealthy' | 'degraded';
+  status: 'healthy' | 'unhealthy' | 'degraded' | 'mock' | 'not_configured';
   latency_ms?: number;
   details?: string;
 }
@@ -343,7 +451,7 @@ export type RequestStatus =
   | 'EXPIRED'
   | 'CANCELLED'
   | 'ACTIVE';
-export type SessionStatus = 'CREATED' | 'STARTING' | 'ACTIVE' | 'TERMINATING' | 'COMPLETED' | 'FAILED' | 'EXPIRED';
+export type SessionStatus = 'CREATED' | 'STARTING' | 'ACTIVE' | 'TERMINATING' | 'TERMINATED' | 'COMPLETED' | 'FAILED' | 'EXPIRED';
 
 // --- Pagination ---
 export interface PaginatedResponse<T> {
@@ -352,4 +460,216 @@ export interface PaginatedResponse<T> {
   page: number;
   page_size: number;
   pages: number;
+}
+
+// --- Activity transcript (derived from the terminal stream; observed input, not proof of execution) ---
+export interface TranscriptEvent {
+  seq: number;
+  /** Seconds into the recording when the line was started; matches the cast timeline. */
+  t: number;
+  input: string;
+  output: string;
+  output_truncated: boolean;
+  masked: boolean;
+  redacted: boolean;
+  edited: boolean;
+  confidence: 'high' | 'low';
+  source: string;
+  execution_verified: boolean;
+}
+
+export interface TranscriptResponse {
+  available: boolean;
+  reason: string | null;
+  recording_id: string;
+  session_number: string | null;
+  transcript: {
+    limitations: string;
+    events_truncated: boolean;
+    events: TranscriptEvent[];
+  } | null;
+}
+
+// --- Users & roles (SecurePAM application roles; identity-provider roles carry no authority) ---
+export interface RoleRef { id: string; name: string }
+
+export interface AdminUser {
+  id: string;
+  username: string;
+  full_name: string;
+  email: string;
+  is_active: boolean;
+  is_system_user: boolean;
+  mfa_enabled: boolean;
+  external_id: string | null;
+  identity_source: string;
+  roles: RoleRef[];
+  last_login: string | null;
+  created_at: string;
+  active_sessions: number;
+}
+
+export interface AdminUserDetail extends AdminUser {
+  last_login_ip: string | null;
+  failed_login_count: number;
+  permissions: string[];
+  live_sessions: number;
+}
+
+export interface AdminRole {
+  id: string;
+  name: string;
+  description: string | null;
+  is_system: boolean;
+  is_active: boolean;
+  permissions: { name: string; description: string | null }[];
+  users: { id: string; username: string; is_active: boolean }[];
+}
+
+// --- Concurrent session limit & admin session control ---
+export interface SessionPolicy {
+  max_concurrent_sessions: number;
+  min_allowed: number;
+  max_allowed: number;
+  default: number;
+}
+
+export interface UserSession {
+  id: string;
+  session_number: string;
+  asset_name: string | null;
+  protocol: string;
+  status: SessionStatus;
+  start_time: string | null;
+  end_time: string | null;
+  created_at: string;
+  recording_status: Recording['status'] | null;
+  jit_grant_id: string | null;
+}
+
+/** Approved, unexpired grant with no live session: access that exists but is not in use. */
+export interface ReadyGrant {
+  id: string;
+  request_id: string;
+  request_number: string | null;
+  asset_name: string | null;
+  protocol: string;
+  expires_at: string;
+}
+
+export interface UserAccess {
+  user_id: string;
+  username: string;
+  session_limit: number;
+  active_sessions: number;
+  sessions: UserSession[];
+  ready_grants: ReadyGrant[];
+}
+
+export interface TerminationOutcome {
+  session_id: string;
+  session_number: string;
+  ok: boolean;
+  status: string;
+  gateway: 'closed' | 'not_connected' | 'delegated' | 'failed';
+  recording: string | null;
+  grant_revoked: boolean | null;
+  errors: string[];
+}
+
+export interface TerminateAllResult {
+  user_id: string;
+  complete: boolean;
+  terminated: number;
+  results: TerminationOutcome[];
+}
+
+// --- User administration ---
+export interface UserCreateInput {
+  username: string;
+  email: string;
+  full_name: string;
+  external_id?: string;
+  password?: string;
+  role_ids: string[];
+}
+export interface UserUpdateInput {
+  email?: string;
+  full_name?: string;
+  external_id?: string;
+}
+
+// --- Integrated credential provisioning ---
+export interface CredentialInput {
+  secret_name: string;
+  username: string;
+  password: string;
+  secret_type?: 'PASSWORD' | 'SSH_KEY';
+}
+export interface ProvisioningStatus {
+  configured: boolean;
+  reason: string;
+  secret_provider: string;
+  references: { name: string; path: string; bound_asset_id: string | null; bound_asset_name: string | null }[];
+  openbao_ui_url: string | null;
+}
+export interface ProvisionedCredential {
+  asset: Asset;
+  vault_path: string;
+  version: number;
+  username: string;
+  verified: boolean;
+}
+export interface ProvisioningErrorBody {
+  stage: 'validate' | 'configure' | 'write' | 'verify';
+  error_code: string;
+  detail: string;
+  recovery: string;
+  written_version: number | null;
+}
+
+// --- Risk Centre ---
+export type FindingSeverity = 'CRITICAL' | 'HIGH' | 'MEDIUM' | 'LOW' | 'INFO';
+export interface RiskFinding {
+  id: string;
+  rule_code: string;
+  source: string;
+  title: string;
+  description: string;
+  severity: FindingSeverity;
+  status: 'OPEN' | 'ACKNOWLEDGED' | 'RESOLVED';
+  subject: string;
+  asset_id: string | null;
+  application_id: string | null;
+  user_id: string | null;
+  session_id: string | null;
+  evidence: Record<string, unknown> & { references?: string[]; count?: number };
+  remediation: string;
+  first_seen: string;
+  last_seen: string;
+  occurrences: number;
+  status_changed_at: string | null;
+  status_note: string | null;
+}
+export interface RiskFindingDetail extends RiskFinding {
+  asset_name: string | null;
+  application_name: string | null;
+  username: string | null;
+  evidence_events: { reference: string; found: boolean; timestamp?: string | null; action?: string | null;
+    actor?: string | null; result?: string | null; session_id?: string | null }[];
+}
+export interface RiskDayPoint { day: string; counts: Record<string, number> }
+export interface RiskSummary {
+  window_days: number;
+  open_by_severity: Record<FindingSeverity, number>;
+  by_status: Record<'OPEN' | 'ACKNOWLEDGED' | 'RESOLVED', number>;
+  by_rule: Record<string, number>;
+  by_source: Record<string, number>;
+  new_findings_per_day: RiskDayPoint[];
+  access_risk_by_level: Record<string, number>;
+  access_risk_per_day: RiskDayPoint[];
+  total_findings: number;
+  last_evaluated_at: string | null;
+  rules: Record<string, string>;
+  thresholds: Record<string, number>;
 }

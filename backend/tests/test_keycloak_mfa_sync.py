@@ -76,7 +76,8 @@ async def test_imports_otp_failure_and_uses_username_fallback(
     assert record.event_id.startswith("kc-")
     assert record.actor_username == "Keycloak user (username unavailable)"
     assert record.details["source"] == "keycloak"
-    assert record.details["credential_id_present"] is True
+    assert record.details["second_factor_failure"] is True
+    assert record.severity == "MEDIUM"
 
 
 @pytest.mark.asyncio
@@ -153,3 +154,84 @@ async def test_repeat_import_does_not_duplicate_event(
         select(AuditLog).where(AuditLog.action == "MFA_FAILURE")
     )
     assert len(result.scalars().all()) == 1
+
+
+@pytest.mark.asyncio
+async def test_settings_credentials_and_traceable_stats(db_session, monkeypatch):
+    """A host-run backend loads .env through settings (not os.environ): that path must work, and
+    the counts must explain a zero import."""
+    from pydantic import SecretStr
+    from app.core.config import settings
+
+    monkeypatch.delenv("KEYCLOAK_AUDIT_CLIENT_ID", raising=False)
+    monkeypatch.delenv("KEYCLOAK_AUDIT_CLIENT_SECRET", raising=False)
+    monkeypatch.setattr(settings, "KEYCLOAK_AUDIT_CLIENT_ID", "securepam-audit-reader")
+    monkeypatch.setattr(settings, "KEYCLOAK_AUDIT_CLIENT_SECRET", SecretStr("from-settings"))
+    events = [make_event("dup-1"), make_event("dup-1"), make_event("pw", selected_credential_id=None),
+              make_event("old", minutes_ago=180)]
+    client = AsyncMock()
+    client.post.return_value = mock_response({"access_token": "fake-token"})
+    client.get.return_value = mock_response(events)
+    stats: dict = {}
+    with patch("app.services.keycloak_mfa_sync.httpx.AsyncClient") as factory:
+        factory.return_value.__aenter__.return_value = client
+        imported = await sync_keycloak_mfa_failures(db_session, lookback_hours=1, stats=stats)
+    assert imported == 1  # the same event twice in one response is imported once
+    assert stats == {"fetched": 4, "otp_failures": 3, "outside_lookback": 1, "already_imported": 1, "imported": 1}
+    assert client.post.call_args.kwargs["data"]["client_secret"] == "from-settings"
+
+
+@pytest.mark.asyncio
+async def test_forbidden_events_endpoint_is_reported_precisely(db_session, monkeypatch):
+    monkeypatch.setenv("KEYCLOAK_AUDIT_CLIENT_ID", "test-client")
+    monkeypatch.setenv("KEYCLOAK_AUDIT_CLIENT_SECRET", "test-secret")
+    forbidden = MagicMock(status_code=403)
+    client = AsyncMock()
+    client.post.return_value = mock_response({"access_token": "fake-token"})
+    client.get.return_value = forbidden
+    with patch("app.services.keycloak_mfa_sync.httpx.AsyncClient") as factory:
+        factory.return_value.__aenter__.return_value = client
+        with pytest.raises(RuntimeError, match="view-events"):
+            await sync_keycloak_mfa_failures(db_session, lookback_hours=1)
+
+
+@pytest.mark.asyncio
+async def test_imported_events_reach_the_siem_sink_without_secrets(db_session, monkeypatch, tmp_path):
+    import json
+    from app.core.config import settings
+
+    sink = tmp_path / "siem.jsonl"
+    monkeypatch.setattr(settings, "SIEM_EVENT_LOG_PATH", str(sink))
+    monkeypatch.setenv("KEYCLOAK_AUDIT_CLIENT_ID", "test-client")
+    monkeypatch.setenv("KEYCLOAK_AUDIT_CLIENT_SECRET", "test-secret-canary")
+    client = AsyncMock()
+    client.post.return_value = mock_response({"access_token": "token-canary"})
+    client.get.return_value = mock_response([make_event("siem-1", username="alice")])
+    with patch("app.services.keycloak_mfa_sync.httpx.AsyncClient") as factory:
+        factory.return_value.__aenter__.return_value = client
+        assert await sync_keycloak_mfa_failures(db_session, lookback_hours=1) == 1
+    line = json.loads(sink.read_text().strip())["securepam"]
+    assert line["action"] == "MFA_FAILURE" and line["actor"] == "alice" and line["details"]["second_factor_failure"] is True
+    assert "canary" not in sink.read_text()
+
+
+def test_audit_reader_secret_can_come_from_a_protected_file(tmp_path):
+    """Container/ECS delivery: KEYCLOAK_AUDIT_CLIENT_SECRET_FILE (0600). Group/world-readable is refused."""
+    import os
+    from app.core.config import Settings, SettingsError
+
+    f = tmp_path / "reader.secret"
+    f.write_text("file-secret-canary\n")
+    os.chmod(f, 0o600)
+    s = Settings(_env_file=None, KEYCLOAK_AUDIT_CLIENT_SECRET_FILE=str(f))
+    assert s.KEYCLOAK_AUDIT_CLIENT_SECRET.get_secret_value() == "file-secret-canary"
+    assert "file-secret-canary" not in repr(s)
+    # an explicit environment value wins over the file
+    assert Settings(_env_file=None, KEYCLOAK_AUDIT_CLIENT_SECRET="env-value",
+                    KEYCLOAK_AUDIT_CLIENT_SECRET_FILE=str(f)).KEYCLOAK_AUDIT_CLIENT_SECRET.get_secret_value() == "env-value"
+    os.chmod(f, 0o644)
+    with pytest.raises(SettingsError, match="chmod 600") as exc:
+        Settings(_env_file=None, KEYCLOAK_AUDIT_CLIENT_SECRET_FILE=str(f))
+    assert "file-secret-canary" not in str(exc.value)
+    with pytest.raises(SettingsError, match="cannot be read"):
+        Settings(_env_file=None, KEYCLOAK_AUDIT_CLIENT_SECRET_FILE=str(tmp_path / "missing"))
