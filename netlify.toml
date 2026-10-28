@@ -1,0 +1,14 @@
+# Netlify: static portfolio demo of the SecurePAM frontend (sample data, no backend).
+[build]
+  base = "frontend"
+  command = "npm ci && npx vite build --config vite.demo.config.ts"
+  publish = "dist-demo"
+
+[build.environment]
+  NODE_VERSION = "20"
+
+# Single-page app: send every route to index.html.
+[[redirects]]
+  from = "/*"
+  to = "/index.html"
+  status = 200

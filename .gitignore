@@ -106,3 +106,6 @@ id_ed25519*
 # Secret-bearing Keycloak realm exports and local handoff packages
 *-realm.json
 SecurePAM_keycloak_Package.*
+
+# Netlify portfolio demo build output
+frontend/dist-demo/
